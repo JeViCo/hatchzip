@@ -54,6 +54,9 @@ const AFTER_LONG_HELP: &str = "\
 Examples:
   hatchzip check game.zip              Show the space plan without modifying anything
   hatchzip extract game.zip            Extract to ./game, removing game.zip during extraction
+  hatchzip pack game                  Pack the folder into game.7z, removing it as it goes
+  hatchzip pack game -o D:\\Backups\\game.7z
+                                       Pack into a given archive
   hatchzip extract game.zip --keep-archive
                                        Extract to ./game and keep game.zip unchanged
   hatchzip check game.zip --keep-archive
@@ -144,6 +147,33 @@ pub enum Command {
         space: Space,
         /// Skip the confirmation prompt (required outside a terminal, unless
         /// --keep-archive is given)
+        #[arg(short, long)]
+        yes: bool,
+    },
+    /// Pack a folder into a 7z beside it, removing the folder progressively
+    #[command(
+        long_about = "Pack a folder into a 7z beside it, removing the folder progressively.\n\n\
+            The other direction of extract: each file is deleted once its compressed copy is \
+            safely in the archive, so the disk never holds much more than whichever of the \
+            folder and the archive is larger. A pack can be interrupted at any time; run the \
+            same command to resume it.\n\n\
+            The archive is a normal 7z that 7-Zip and HatchZip read, with every file \
+            compressed on its own (as 7-Zip's -ms=off writes).\n\n\
+            Files that are links, and a folder holding files with more than one name on the \
+            disk, are refused before anything is packed. A single file larger than the space \
+            free beside it is refused too, since it can only be deleted once its whole block \
+            is written."
+    )]
+    Pack {
+        /// The folder to pack
+        #[arg(required = true, value_name = "FOLDER")]
+        source: PathBuf,
+        /// Where the archive goes [default: <folder>.7z, next to the folder]
+        #[arg(short, long, value_name = "ARCHIVE")]
+        output: Option<PathBuf>,
+        #[command(flatten)]
+        space: Space,
+        /// Skip the confirmation prompt (required outside a terminal)
         #[arg(short, long)]
         yes: bool,
     },

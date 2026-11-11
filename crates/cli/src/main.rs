@@ -1,5 +1,5 @@
 mod cli;
-
+use std::fs;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -59,6 +59,8 @@ fn fail(e: &anyhow::Error) -> u8 {
             eprintln!("Pass --password or set HATCHZIP_PASSWORD when not running in a terminal.");
         }
         EXIT_PASSWORD
+    } else if e.is::<hatchzip_core::pack::NoSpace>() {
+        EXIT_NO_SPACE
     } else if e.is::<Damaged>() {
         EXIT_DAMAGED
     } else {
@@ -200,6 +202,12 @@ fn run(command: Command) -> Result<u8> {
             };
             extract_all(target, opts)
         }
+        Command::Pack {
+            source,
+            output,
+            space,
+            yes,
+        } => pack_command(source, output, space, yes),
         Command::Check {
             target,
             keep,
@@ -920,4 +928,118 @@ fn progress_bar(total: u64, prefix: &'static str) -> ProgressBar {
     bar.set_prefix(prefix);
     bar.enable_steady_tick(Duration::from_millis(200));
     bar
+}
+
+/// Packs one folder, asking before the first file is deleted, and resuming
+/// where a stopped pack left off.
+fn pack_command(source: PathBuf, output: Option<PathBuf>, space: Space, yes: bool) -> Result<u8> {
+    ctrlc::set_handler(|| {
+        if STOP.swap(true, Ordering::Relaxed) {
+            std::process::exit(EXIT_PAUSED.into());
+        }
+        eprintln!(
+            "\nPausing after the current batch. The file being packed is packed again on \
+             resume. Press Ctrl+C again to exit immediately."
+        );
+    })
+    .context("installing Ctrl+C handler")?;
+
+    let source =
+        fs::canonicalize(&source).with_context(|| format!("finding {}", source.display()))?;
+    let target = match &output {
+        Some(t) => {
+            std::path::absolute(t).with_context(|| format!("reading the path {}", t.display()))?
+        }
+        None => hatchzip_core::pack::target_for(&source)?,
+    };
+    let said_source = hatchzip_core::pack::shown(&source);
+    let said_target = hatchzip_core::pack::shown(&target);
+    let mut journal = target.as_os_str().to_os_string();
+    journal.push(".hatchzip");
+    let resuming = Path::new(&journal).exists();
+
+    let (done, total) = if resuming {
+        say!("Resuming the pack of {}.", said_source.display());
+        hatchzip_core::pack::progress_of(&target).unwrap_or((0, 0))
+    } else {
+        let plan = hatchzip_core::pack::space_plan(&source, &target, space.keep_free)?;
+        say!(
+            "Packing {} into {}: {} files, {} folders, {}.",
+            said_source.display(),
+            said_target.display(),
+            plan.files,
+            plan.folders,
+            human(plan.bytes)
+        );
+        say!(
+            "  {DIM}needs up to {} free while it runs, {} free{DIM:#}",
+            human(plan.needs),
+            human(plan.avail)
+        );
+        if !plan.fits {
+            eprintln!(
+                "{ERROR}error:{ERROR:#} packing needs {} free while it runs, {} free. \
+                 Free that much, or pack into another disk",
+                human(plan.needs),
+                human(plan.avail)
+            );
+            return Ok(EXIT_NO_SPACE);
+        }
+        if !yes {
+            confirm_pack(&said_source, &said_target)?;
+        }
+        (0, plan.bytes)
+    };
+
+    let bar = progress_bar(total, "Packing");
+    bar.set_position(done);
+    let b = bar.clone();
+    let outcome = hatchzip_core::pack::pack(
+        &source,
+        output.as_deref(),
+        space.keep_free,
+        &STOP,
+        Progress {
+            on_bytes: Box::new(move |n| b.set_position(n)),
+            on_commit: Box::new(|_| {}),
+        },
+    );
+    bar.finish_and_clear();
+
+    match outcome {
+        Ok(Outcome::Finished(warning)) => {
+            if let Some(warning) = warning {
+                eprintln!("warning: {warning}");
+            }
+            say!("{GOOD}Pack complete:{GOOD:#} {}.", target.display());
+            Ok(0)
+        }
+        Ok(Outcome::Paused) => {
+            say!("Pack paused. Run the same command to resume.");
+            Ok(EXIT_PAUSED)
+        }
+        Err(e) => {
+            eprintln!("{ERROR}error:{ERROR:#} {e:#}");
+            eprintln!("Progress is saved. Run the same command to resume.");
+            Ok(EXIT_FAILURE)
+        }
+    }
+}
+
+fn confirm_pack(source: &Path, target: &Path) -> Result<()> {
+    if !io::stdin().is_terminal() {
+        bail!("HatchZip removes the folder as it packs; pass --yes to confirm");
+    }
+    print!(
+        "\nPack {} into {} and remove the folder as it goes? [y/N] ",
+        source.display(),
+        target.display()
+    );
+    io::stdout().flush()?;
+    let mut answer = String::new();
+    io::stdin().lock().read_line(&mut answer)?;
+    if !matches!(answer.trim(), "y" | "Y" | "yes") {
+        bail!("pack cancelled. Nothing was modified");
+    }
+    Ok(())
 }
