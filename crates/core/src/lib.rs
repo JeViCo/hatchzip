@@ -10,7 +10,8 @@
 //! Front ends start in [`session`]: locate an archive, open it (fresh or
 //! half-extracted), get a [`session::SpacePlan`], then hand a [`engine::Run`]
 //! the job. [`restore`] turns a half-extracted archive back into a normal
-//! one instead.
+//! one instead. The other direction, packing a folder while freeing each
+//! file as its compressed copy becomes durable, starts in [`pack::pack`].
 
 pub mod archive;
 mod chosen;
@@ -18,6 +19,7 @@ pub mod engine;
 mod folders;
 mod fsutil;
 pub mod journal;
+pub mod pack;
 mod platform;
 pub mod replace;
 pub mod restore;

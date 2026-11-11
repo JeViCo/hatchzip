@@ -54,6 +54,23 @@ pub fn same_path(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// The path as a person writes it, without the `\\?\` form Windows
+/// `canonicalize` returns, which reads badly in a message.
+pub fn plain(path: &Path) -> PathBuf {
+    let s = path.as_os_str().as_encoded_bytes();
+    // A drive: \\?\C:\... becomes C:\...; a share: \\?\UNC\server\share
+    // becomes \\server\share. Anything else is already plain.
+    if s.starts_with(b"\\\\?\\UNC\\") {
+        let mut back = b"\\\\".to_vec();
+        back.extend_from_slice(&s["\\\\?\\UNC\\".len()..]);
+        return PathBuf::from(unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(&back) });
+    }
+    if s.starts_with(b"\\\\?\\") && s.get(5) == Some(&b':') {
+        return PathBuf::from(unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(&s[4..]) });
+    }
+    path.to_path_buf()
+}
+
 /// The output folder may not exist yet, so ask about the nearest parent that
 /// does.
 pub fn existing_ancestor(path: &Path) -> PathBuf {
@@ -261,6 +278,23 @@ pub fn from_filetime(ticks: u64) -> Option<SystemTime> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The verbatim forms Windows hands out read the way a person writes
+    /// them; a path that is already plain is not touched.
+    #[test]
+    fn verbatim_paths_read_plainly() {
+        let said = |p: &Path| plain(p).to_string_lossy().into_owned();
+        #[cfg(windows)]
+        {
+            assert_eq!(said(Path::new(r"\\?\C:\games\doom")), r"C:\games\doom");
+            assert_eq!(
+                said(Path::new(r"\\?\UNC\server\share\game")),
+                r"\\server\share\game"
+            );
+        }
+        assert_eq!(said(Path::new(r"C:\games\doom")), r"C:\games\doom");
+        assert_eq!(said(Path::new("/games/doom")), "/games/doom");
+    }
 
     #[test]
     fn names_fold_as_filesystems_fold_them() {

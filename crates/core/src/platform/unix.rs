@@ -137,6 +137,12 @@ pub fn path_len(path: &Path) -> usize {
 pub fn sync_dir(dir: &Path) -> io::Result<()> {
     File::open(dir)?.sync_all()
 }
+/// The Unix mode with its type bits, the form 7-Zip keeps in the Windows
+/// attributes of an archive.
+pub fn mode(meta: &fs::Metadata) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    Some(meta.mode())
+}
 
 /// Never recreate setuid, setgid or sticky bits from an archive.
 pub fn apply_mode(file: &File, mode: Option<u32>) -> io::Result<()> {

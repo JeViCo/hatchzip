@@ -298,13 +298,33 @@ impl Journal {
             .with_context(|| format!("reading {}", paths.journal.display()))?;
         // The version is checked before the rest is parsed, so a newer layout
         // gets the version message rather than a confusing parse error.
+        // Version 9 is the pack journal's version, and `kind` is what says
+        // so: a future extraction layout with the same number gets the
+        // generic refusal below instead of a pack it knows nothing of.
         #[derive(Deserialize)]
-        struct Versioned {
+        struct Peek {
             version: u32,
+            kind: Option<String>,
         }
-        let version = serde_json::from_slice::<Versioned>(&bytes)
-            .with_context(|| format!("{} is damaged", paths.journal.display()))?
-            .version;
+        let peek: Peek = serde_json::from_slice(&bytes)
+            .with_context(|| format!("{} is damaged", paths.journal.display()))?;
+        let version = peek.version;
+        if version == crate::pack::VERSION && peek.kind.as_deref() == Some("pack") {
+            #[derive(Deserialize)]
+            struct Packed {
+                source: PathBuf,
+            }
+            let source = serde_json::from_slice::<Packed>(&bytes)
+                .ok()
+                .map(|p| p.source)
+                .unwrap_or_else(|| PathBuf::from("its source folder"));
+            bail!(
+                "{} is the journal of a pack in progress, not an extraction. \
+                 Run `hatchzip pack` on '{}' to finish it",
+                paths.journal.display(),
+                source.display()
+            );
+        }
         if !READABLE.contains(&version) {
             let which = if version > VERSION {
                 "a newer"

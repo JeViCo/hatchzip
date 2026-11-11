@@ -5,7 +5,7 @@ use std::path::Path;
 
 pub use super::unix::{
     allocated_bytes, apply_mode, create_new_no_follow, create_symlink, link_count, local_time,
-    name_problem, open_exclusive, open_existing_no_follow, open_folder_no_follow, path_len,
+    mode, name_problem, open_exclusive, open_existing_no_follow, open_folder_no_follow, path_len,
     same_filesystem, sync_dir, unlock_folder,
 };
 

@@ -149,6 +149,10 @@ pub fn same_filesystem(a: &Path, b: &Path) -> bool {
     };
     volume(a).is_some_and(|v| Some(v) == volume(b))
 }
+/// Windows has no mode bits an archive could keep.
+pub fn mode(_meta: &fs::Metadata) -> Option<u32> {
+    None
+}
 
 pub fn apply_mode(_file: &File, _mode: Option<u32>) -> io::Result<()> {
     Ok(())
