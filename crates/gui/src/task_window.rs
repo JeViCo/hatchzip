@@ -139,17 +139,26 @@ pub fn build(args: TaskArgs, settings: Settings) -> Result<(TaskWindow, impl FnO
                 match view.phase {
                     crate::Phase::Paused => view.message = ui.invoke_pack_paused(),
                     crate::Phase::Done => {
-                        let warning = task
-                            .warning
-                            .as_ref()
-                            .map(|w| format!("{w}."))
-                            .unwrap_or_default();
                         let target = task
                             .packed_into
                             .as_ref()
                             .map(|t| t.display().to_string())
                             .unwrap_or_default();
-                        view.message = ui.invoke_packed_result(target.into(), warning.into());
+                        view.message = if task.finished_early() {
+                            let (packed, total) = task.early_counts().unwrap_or((0, 0));
+                            ui.invoke_finish_result(
+                                target.into(),
+                                packed.to_string().into(),
+                                total.to_string().into(),
+                            )
+                        } else {
+                            let warning = task
+                                .warning
+                                .as_ref()
+                                .map(|w| format!("{w}."))
+                                .unwrap_or_default();
+                            ui.invoke_packed_result(target.into(), warning.into())
+                        };
                     }
                     _ => {}
                 }

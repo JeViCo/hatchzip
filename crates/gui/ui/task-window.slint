@@ -41,6 +41,9 @@ export component TaskWindow inherits Window {
         if (warning == "") { return @tr("The folder was packed into {}.", target); }
         return @tr("The folder was packed into {}. {}", target, warning);
     }
+    public function finish-result(target: string, packed: string, total: string) -> string {
+        return @tr("The archive at {} holds {} of the {} files packed so far; the rest are still in the folder.", target, packed, total);
+    }
 
     callback replace-answer(int, bool);
     callback replace-cancel();

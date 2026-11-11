@@ -73,8 +73,8 @@ impl Runner {
     }
 
     /// Stops a paused or failed extraction for good, giving the archive
-    /// back. The engine's journal makes this safe at any point that isn't
-    /// mid-run.
+    /// back, or ends a stopped pack early, keeping what it packed. The
+    /// engine's journal makes both safe at any point that isn't mid-run.
     pub fn give_back(&self) {
         if self.running() {
             return;
@@ -92,11 +92,23 @@ impl Runner {
             .borrow()
             .as_ref()
             .map_or_else(String::new, |t| t.name().to_string());
+        let packing = self
+            .task
+            .borrow()
+            .as_ref()
+            .is_some_and(|t| t.is_packing() && !t.finished_early());
         // Stopping one archive for good stops the rest too; nothing more
         // starts behind the person's back.
         self.queue.borrow_mut().clear();
         self.place.set((1, 1));
-        self.start(Task::restore(&name), Request::Restore { archive });
+        if packing {
+            self.start(
+                Task::pack(&name, None),
+                Request::PackFinish { source: archive },
+            );
+        } else {
+            self.start(Task::restore(&name), Request::Restore { archive });
+        }
     }
 
     pub fn running(&self) -> bool {

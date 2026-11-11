@@ -28,6 +28,11 @@ pub struct Task {
     /// For a pack, the archive being built; `output` stays its folder,
     /// where the open-folder button goes.
     pub packed_into: Option<PathBuf>,
+    /// The pack was ended early: the archive holds the packed prefix and
+    /// the folder kept the rest.
+    finished_early: bool,
+    /// Its counts, for the finished-early message.
+    early: Option<(u64, u64)>,
     name: String,
     is_test: bool,
     restoring: bool,
@@ -80,6 +85,7 @@ impl Task {
         task.packing = true;
         // new() computed the heading before the run knew it was a pack.
         task.view.heading = task.heading().into();
+        task.view.packing = true;
         if let Some(t) = target {
             task.packed_into = Some(t.to_path_buf());
             task.view.detail = format!("Destination: {}", t.display()).into();
@@ -113,6 +119,8 @@ impl Task {
             resumable_failure: None,
             warning: None,
             packed_into: None,
+            finished_early: false,
+            early: None,
             name: name.to_string(),
             is_test,
             restoring: false,
@@ -137,6 +145,14 @@ impl Task {
 
     pub fn is_packing(&self) -> bool {
         self.packing
+    }
+
+    pub fn finished_early(&self) -> bool {
+        self.finished_early
+    }
+
+    pub fn early_counts(&self) -> Option<(u64, u64)> {
+        self.early
     }
 
     pub fn keeps_archive(&self) -> bool {
@@ -325,6 +341,26 @@ impl Task {
                 v.message = message.into();
                 v.can_open_folder = true;
             }
+            Update::FinishedEarly {
+                target,
+                packed,
+                total,
+            } => {
+                self.finished_early = true;
+                self.early = Some((packed, total));
+                self.packed_into = Some(target.clone());
+                v.phase = Phase::Done;
+                v.fraction = 1.0;
+                v.rate = "".into();
+                v.archive_left = "".into();
+                v.message = format!(
+                    "The archive at {} holds {packed} of the {total} files packed so far; \
+                     the rest are still in the folder.",
+                    target.display()
+                )
+                .into();
+                v.can_open_folder = true;
+            }
             Update::Tested(entries) => {
                 self.tested_entries = Some(entries);
                 v.phase = Phase::Done;
@@ -395,14 +431,21 @@ impl Task {
         }
         self.view.heading = self.heading().into();
         // Half extracted and not running: the archive can be put back. A
-        // kept archive was never taken apart, and a pack has nothing to
-        // put back; its folder went into the archive for good.
-        self.view.can_give_back = !self.restoring
-            && !self.is_test
-            && !self.packing
-            && !self.keep
-            && (self.view.phase == Phase::Paused
-                || (self.view.phase == Phase::Failed && self.resumable));
+        // kept archive was never taken apart. A stopped pack cannot be put
+        // back, but it can be finished early, keeping what is packed so
+        // far and leaving the rest of the folder in place.
+        self.view.can_give_back = if self.packing {
+            !self.finished_early
+                && (self.view.phase == Phase::Paused
+                    || self.view.phase == Phase::NoSpace
+                    || (self.view.phase == Phase::Failed && self.resumable))
+        } else {
+            !self.restoring
+                && !self.is_test
+                && !self.keep
+                && (self.view.phase == Phase::Paused
+                    || (self.view.phase == Phase::Failed && self.resumable))
+        };
     }
 
     /// Reads the counters the worker bumps and refreshes the numbers.
@@ -701,7 +744,8 @@ mod tests {
         t.apply(Update::Paused);
         assert_eq!(t.view.phase, Phase::Paused);
         assert_eq!(t.view.heading, "Pack paused");
-        assert!(!t.view.can_give_back, "a pack has nothing to put back");
+        // Paused, the give-back button offers to finish early instead.
+        assert!(t.view.can_give_back);
 
         t.apply(Update::Packed {
             target: "/games/game.7z".into(),
@@ -742,7 +786,8 @@ mod tests {
             "Disk full. Progress is saved; the pack can be resumed."
         );
         assert!(t.view.can_retry);
-        assert!(!t.view.can_give_back);
+        // A failed pack offers finish early, not restore.
+        assert!(t.view.can_give_back);
     }
 
     #[test]
@@ -796,4 +841,25 @@ mod tests {
             assert_eq!(task.keeps_archive(), keep);
         }
     }
+}
+
+/// A stopped pack offers finish instead of restore, and once finished
+/// the offer goes away with the summary on screen.
+#[test]
+fn a_stopped_pack_offers_finishing_early() {
+    let mut t = Task::pack("game", Some(Path::new("/games/game.7z")));
+    assert!(!t.view.can_give_back);
+    t.apply(Update::Paused);
+    assert_eq!(t.view.phase, Phase::Paused);
+    assert!(t.view.can_give_back);
+
+    t.apply(Update::FinishedEarly {
+        target: Path::new("/games/game.7z").into(),
+        packed: 3,
+        total: 9,
+    });
+    assert_eq!(t.view.phase, Phase::Done);
+    assert!(t.view.message.contains("3 of the 9 files"));
+    assert!(!t.view.can_give_back);
+    assert_eq!(t.output.as_deref(), Some(Path::new("/games")));
 }

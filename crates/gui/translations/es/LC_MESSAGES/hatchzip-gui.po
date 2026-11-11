@@ -400,3 +400,9 @@ msgstr "La carpeta se empaquetó en {}."
 
 msgid "The folder was packed into {}. {}"
 msgstr "La carpeta se empaquetó en {}. {}"
+
+msgid "Finish what is packed"
+msgstr "Terminar lo empaquetado"
+
+msgid "The archive at {} holds {} of the {} files packed so far; the rest are still in the folder."
+msgstr "El archivo en {} conserva {} de los {} archivos empaquetados hasta ahora; el resto sigue en la carpeta."

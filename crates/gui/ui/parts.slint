@@ -53,6 +53,8 @@ export struct TaskView {
     can-retry: bool,
     // Paused or stopped halfway: offer to undo it.
     can-give-back: bool,
+    // A pack: the undo button finishes early instead of restoring.
+    packing: bool,
 }
 
 component Row inherits HorizontalLayout {
@@ -219,7 +221,7 @@ export component TaskButtons inherits HorizontalLayout {
     spacing: 8px;
 
     if root.task.can-give-back: Button {
-        text: @tr("Restore archive");
+        text: root.task.packing ? @tr("Finish what is packed") : @tr("Restore archive");
         clicked => {
             root.give-back();
         }

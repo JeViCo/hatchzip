@@ -62,6 +62,9 @@ pub enum Request {
     /// Packs the folder into the archive that appears beside it. No
     /// password: a fresh 7z is written without one.
     Pack { source: PathBuf, keep_free: u64 },
+    /// Ends a pack in progress: what is packed so far becomes a readable
+    /// archive beside the folder, and the rest of the folder stays.
+    PackFinish { source: PathBuf },
     /// Stops for good: turns a half-extracted archive back into a normal one.
     Restore { archive: PathBuf },
 }
@@ -74,14 +77,14 @@ impl Request {
             | Self::Restore { archive } => archive,
             // The source stands in: a pack is never restored, and the
             // restore request is never built for one.
-            Self::Pack { source, .. } => source,
+            Self::Pack { source, .. } | Self::PackFinish { source } => source,
         }
     }
 
     pub fn password(&self) -> Option<&str> {
         match self {
             Self::Extract { password, .. } | Self::Test { password, .. } => password.as_deref(),
-            Self::Pack { .. } | Self::Restore { .. } => None,
+            Self::Pack { .. } | Self::PackFinish { .. } | Self::Restore { .. } => None,
         }
     }
 
@@ -90,7 +93,7 @@ impl Request {
     pub fn set_password(&mut self, p: String) {
         match self {
             Self::Extract { password, .. } | Self::Test { password, .. } => *password = Some(p),
-            Self::Pack { .. } | Self::Restore { .. } => {}
+            Self::Pack { .. } | Self::PackFinish { .. } | Self::Restore { .. } => {}
         }
     }
 }
@@ -141,6 +144,13 @@ pub enum Update {
     Packed {
         target: PathBuf,
         warning: Option<String>,
+    },
+    /// A pack was finished early: the packed files are in this archive,
+    /// the rest never left the folder.
+    FinishedEarly {
+        target: PathBuf,
+        packed: u64,
+        total: u64,
     },
     Tested(usize),
     /// The archive is whole again, holding this many entries; the ones
@@ -208,6 +218,7 @@ pub fn run(
             send,
         ),
         Request::Pack { source, keep_free } => pack(source, *keep_free, counters, send),
+        Request::PackFinish { source } => pack_finish(source, send),
         Request::Restore { archive } => restore(archive, send),
     };
     if let Err(e) = result {
@@ -522,6 +533,19 @@ fn pack(
     Ok(())
 }
 
+/// Ends a stopped pack: the archive becomes readable with the files it
+/// already holds, and the folder keeps everything else.
+fn pack_finish(source: &Path, send: &dyn Fn(Update)) -> Result<()> {
+    send(Update::Checking);
+    let done = hatchzip_core::pack::finish(source, None)?;
+    send(Update::FinishedEarly {
+        target: hatchzip_core::pack::shown(&done.target),
+        packed: done.packed,
+        total: done.total,
+    });
+    Ok(())
+}
+
 fn restore(archive: &Path, send: &dyn Fn(Update)) -> Result<()> {
     send(Update::Checking);
     let r = hatchzip_core::restore::restore(archive, None)?;
@@ -633,6 +657,7 @@ mod tests {
             Update::Unlocked(p) => format!("unlocked {p}"),
             Update::Planned(_) => "planned".to_string(),
             Update::NoSpace { .. } => "no space".to_string(),
+            Update::FinishedEarly { .. } => "finished early".to_string(),
             Update::Verifying => "verifying".to_string(),
             Update::Working { keep: false, .. } => "working".to_string(),
             Update::Working { keep: true, .. } => "working, keeping the archive".to_string(),
@@ -1126,5 +1151,36 @@ mod tests {
             std::fs::read(dir.path().join("out/data/file7.bin")).unwrap(),
             vec![7u8; 10_700]
         );
+    }
+
+    /// A pack paused before its first commit has nothing to keep: finishing
+    /// early removes the half-made archive and leaves the folder alone.
+    #[test]
+    fn a_paused_pack_finishes_early_when_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("game");
+        std::fs::create_dir_all(source.join("data")).unwrap();
+        std::fs::write(source.join("data/file1.bin"), vec![1u8; 50_000]).unwrap();
+        std::fs::write(source.join("top.txt"), b"top").unwrap();
+        let counters = Arc::new(Counters::default());
+        counters.stop.store(true, Ordering::Relaxed);
+        let request = Request::Pack {
+            source: source.clone(),
+            keep_free: 0,
+        };
+        assert_eq!(
+            collect(&request, &counters),
+            ["checking", "packing", "paused"]
+        );
+        assert!(dir.path().join("game.7z.hatchzip").exists());
+
+        let finish = Request::PackFinish {
+            source: source.clone(),
+        };
+        assert_eq!(collect(&finish, &counters), ["checking", "finished early"]);
+        assert!(!dir.path().join("game.7z").exists());
+        assert!(!dir.path().join("game.7z.hatchzip").exists());
+        assert!(source.join("data/file1.bin").is_file());
+        assert!(source.join("top.txt").is_file());
     }
 }

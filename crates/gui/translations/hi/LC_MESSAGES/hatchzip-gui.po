@@ -400,3 +400,9 @@ msgstr "फ़ोल्डर {} में पैक किया गया।"
 
 msgid "The folder was packed into {}. {}"
 msgstr "फ़ोल्डर {} में पैक किया गया। {}"
+
+msgid "Finish what is packed"
+msgstr "जो पैक हो चुका है उसे पूरा करें"
+
+msgid "The archive at {} holds {} of the {} files packed so far; the rest are still in the folder."
+msgstr "{} पर संग्रह में अब तक पैक की गई {} में से {} फ़ाइलें हैं; बाकी फ़ोल्डर में ही हैं।"
