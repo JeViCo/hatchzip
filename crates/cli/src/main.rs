@@ -207,7 +207,8 @@ fn run(command: Command) -> Result<u8> {
             output,
             space,
             yes,
-        } => pack_command(source, output, space, yes),
+            finish,
+        } => pack_command(source, output, space, yes, finish),
         Command::Check {
             target,
             keep,
@@ -932,7 +933,13 @@ fn progress_bar(total: u64, prefix: &'static str) -> ProgressBar {
 
 /// Packs one folder, asking before the first file is deleted, and resuming
 /// where a stopped pack left off.
-fn pack_command(source: PathBuf, output: Option<PathBuf>, space: Space, yes: bool) -> Result<u8> {
+fn pack_command(
+    source: PathBuf,
+    output: Option<PathBuf>,
+    space: Space,
+    yes: bool,
+    finish: bool,
+) -> Result<u8> {
     ctrlc::set_handler(|| {
         if STOP.swap(true, Ordering::Relaxed) {
             std::process::exit(EXIT_PAUSED.into());
@@ -957,6 +964,36 @@ fn pack_command(source: PathBuf, output: Option<PathBuf>, space: Space, yes: boo
     let mut journal = target.as_os_str().to_os_string();
     journal.push(".hatchzip");
     let resuming = Path::new(&journal).exists();
+
+    if finish {
+        if !resuming {
+            bail!(
+                "there is no pack in progress beside {}, so there is nothing to finish early",
+                said_target.display()
+            );
+        }
+        if !yes {
+            confirm_finish(&said_source, &said_target)?;
+        }
+        let done = hatchzip_core::pack::finish(&source, output.as_deref())?;
+        if done.packed == 0 {
+            say!(
+                "Nothing was packed yet. The half-made archive was removed and \
+                 {} is untouched.",
+                said_source.display()
+            );
+        } else {
+            say!(
+                "{GOOD}Kept the {} of {} files packed so far in {}.{GOOD:#} \
+                 The rest are still in {}.",
+                done.packed,
+                done.total,
+                said_target.display(),
+                said_source.display()
+            );
+        }
+        return Ok(0);
+    }
 
     let (done, total) = if resuming {
         say!("Resuming the pack of {}.", said_source.display());
@@ -1040,6 +1077,27 @@ fn confirm_pack(source: &Path, target: &Path) -> Result<()> {
     io::stdin().lock().read_line(&mut answer)?;
     if !matches!(answer.trim(), "y" | "Y" | "yes") {
         bail!("pack cancelled. Nothing was modified");
+    }
+    Ok(())
+}
+
+/// Finishing early is not undoable either: the journal goes away, so the
+/// pack cannot be resumed afterwards.
+fn confirm_finish(source: &Path, target: &Path) -> Result<()> {
+    if !io::stdin().is_terminal() {
+        bail!("finishing a pack early cannot be undone; pass --yes to confirm");
+    }
+    print!(
+        "\nFinish the pack of {} early, keeping what is packed so far in {} and \
+         leaving the rest of the folder in place? [y/N] ",
+        source.display(),
+        target.display()
+    );
+    io::stdout().flush()?;
+    let mut answer = String::new();
+    io::stdin().lock().read_line(&mut answer)?;
+    if !matches!(answer.trim(), "y" | "Y" | "yes") {
+        bail!("finish cancelled. The pack can still be resumed");
     }
     Ok(())
 }

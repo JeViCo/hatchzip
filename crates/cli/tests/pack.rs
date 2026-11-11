@@ -463,3 +463,139 @@ fn leaves_files_that_appeared() {
         "the warning should name what stayed: {text}"
     );
 }
+
+/// A pack stopped halfway can be ended on purpose: what is packed stays in
+/// a readable archive, and everything the walk had not reached stays in
+/// the folder, byte for byte.
+#[test]
+fn finishes_early_keeps_the_packed_prefix() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    // Small, tame content: three megabytes of fresh random bytes have been
+    // known to land in antivirus quarantine between the extract and the
+    // read, which would flake this test.
+    let mut files = Files::new();
+    files.insert(
+        "game/config/settings.ini".into(),
+        b"volume=7\n".repeat(20_000),
+    );
+    files.insert("game/data/small.pak".into(), common::noise(70_000, 2));
+    files.insert("game/many/file00.txt".into(), b"file 0\n".to_vec());
+    let source = make_tree(tmp.path(), &files);
+    let target = tmp.path().join("game.7z");
+
+    let crashed = hatchzip(
+        &[
+            "pack",
+            source.to_str().unwrap(),
+            "--keep-free",
+            "0",
+            "--yes",
+        ],
+        &[
+            ("HATCHZIP_PACK_BATCH", "1000"),
+            ("HATCHZIP_CRASH_AT", "after-journal"),
+            ("HATCHZIP_CRASH_AFTER", "1"),
+        ],
+    );
+    assert!(!crashed.status.success());
+
+    let finished = hatchzip(
+        &[
+            "pack",
+            source.to_str().unwrap(),
+            "--finish",
+            "--keep-free",
+            "0",
+            "--yes",
+        ],
+        &[],
+    );
+    assert!(
+        finished.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&finished.stderr)
+    );
+    let text = String::from_utf8_lossy(&finished.stdout);
+    assert!(text.contains("Kept the"), "{text}");
+
+    // The archive holds exactly the packed prefix: the first batch, and
+    // nothing of the files behind it.
+    assert!(target.is_file());
+    for p in pack_side_files(&target) {
+        assert!(!p.exists(), "{} should be cleaned up", p.display());
+    }
+    let listed = hatchzip(&["list", target.to_str().unwrap()], &[]);
+    assert_ok(&listed);
+    let text = String::from_utf8_lossy(&listed.stdout).replace('\\', "/");
+    assert!(text.contains("config/settings.ini"), "{text}");
+    assert!(text.contains("data/small.pak"), "{text}");
+    assert!(!text.contains("many/file00.txt"), "{text}");
+
+    // The rest of the folder is still there, byte for byte. small.pak is
+    // not among them: it was packed, and is read back from the archive
+    // below.
+    assert_eq!(
+        fs::read(source.join("game/many/file00.txt")).unwrap(),
+        files["game/many/file00.txt"]
+    );
+
+    // The salvage archive extracts on its own.
+    let out = tmp.path().join("out");
+    assert_ok(&common::extract(&target, &out, &[]));
+    assert_eq!(
+        fs::read(out.join("game/config/settings.ini")).unwrap(),
+        files["game/config/settings.ini"]
+    );
+    assert_eq!(
+        fs::read(out.join("game/data/small.pak")).unwrap(),
+        files["game/data/small.pak"]
+    );
+    assert!(!out.join("game/many").exists());
+}
+
+/// Finishing with nothing packed removes the half-made archive and leaves
+/// the folder alone, and finishing without a pack in progress is refused.
+#[test]
+fn finishing_early_with_nothing_packed_cancels_cleanly() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let files = sample_files();
+    let source = make_tree(tmp.path(), &files);
+
+    let crashed = hatchzip(
+        &[
+            "pack",
+            source.to_str().unwrap(),
+            "--keep-free",
+            "0",
+            "--yes",
+        ],
+        &[
+            ("HATCHZIP_CRASH_AT", "after-append"),
+            ("HATCHZIP_CRASH_AFTER", "0"),
+        ],
+    );
+    assert!(!crashed.status.success());
+
+    let finished = hatchzip(
+        &["pack", source.to_str().unwrap(), "--finish", "--yes"],
+        &[],
+    );
+    assert!(
+        finished.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&finished.stderr)
+    );
+    assert!(!tmp.path().join("game.7z").exists());
+    assert!(source.join("game/data/big.pak").is_file());
+    for p in pack_side_files(&tmp.path().join("game.7z")) {
+        assert!(!p.exists(), "{} should be cleaned up", p.display());
+    }
+
+    let refused = hatchzip(
+        &["pack", source.to_str().unwrap(), "--finish", "--yes"],
+        &[],
+    );
+    assert!(!refused.status.success());
+    let text = String::from_utf8_lossy(&refused.stderr);
+    assert!(text.contains("no pack in progress"), "{text}");
+}

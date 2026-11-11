@@ -55,6 +55,7 @@ Examples:
   hatchzip check game.zip              Show the space plan without modifying anything
   hatchzip extract game.zip            Extract to ./game, removing game.zip during extraction
   hatchzip pack game                  Pack the folder into game.7z, removing it as it goes
+  hatchzip pack game --finish         Stop here: keep what is packed so far, leave the rest
   hatchzip pack game -o D:\\Backups\\game.7z
                                        Pack into a given archive
   hatchzip extract game.zip --keep-archive
@@ -176,6 +177,11 @@ pub enum Command {
         /// Skip the confirmation prompt (required outside a terminal)
         #[arg(short, long)]
         yes: bool,
+        /// Finish the pack early: what is packed so far becomes a readable
+        /// archive, and the rest of the folder stays in place. Nothing is
+        /// deleted, but the pack cannot be resumed afterwards
+        #[arg(long)]
+        finish: bool,
     },
     /// Show the space plan for an archive without modifying it
     #[command(visible_alias = "c")]
