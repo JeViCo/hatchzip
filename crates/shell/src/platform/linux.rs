@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 
-use crate::{ACTIONS, Dirs, EXTENSIONS};
+use crate::{ACTIONS, Action, Dirs, EXTENSIONS, Surface};
 
 #[cfg(not(feature = "rar"))]
 const MIME_TYPES: &str = "application/zip;application/x-zip-compressed;application/x-7z-compressed;\
@@ -33,6 +33,13 @@ pub fn current_dirs() -> Result<Dirs> {
 
 fn kde_file(dirs: &Dirs) -> PathBuf {
     dirs.data.join("kio/servicemenus/hatchzip.desktop")
+}
+
+/// A second servicemenu file, because Dolphin matches a menu against the
+/// selection's MIME type: actions for folders can never live beside actions
+/// for archives.
+fn kde_folder_file(dirs: &Dirs) -> PathBuf {
+    dirs.data.join("kio/servicemenus/hatchzip-folders.desktop")
 }
 
 fn nautilus_file(dirs: &Dirs, label: &str) -> PathBuf {
@@ -77,24 +84,46 @@ fn write(path: &Path, contents: &str, executable: bool) -> Result<()> {
     Ok(())
 }
 
-pub fn register(dirs: &Dirs, gui: &Path) -> Result<Vec<String>> {
-    let exec = exec_quote(gui);
-
+/// One Dolphin servicemenu: what it matches plus the actions it offers.
+fn kde_desktop(mime_types: &str, icon: &str, actions: &[&Action], exec: &str) -> String {
     let mut kde = format!(
-        "# {MARK}\n[Desktop Entry]\nType=Service\nMimeType={MIME_TYPES}\nActions={}\n\
-         X-KDE-Submenu=HatchZip\nIcon=archive-extract\n",
-        ACTIONS.iter().map(|a| a.id).collect::<Vec<_>>().join(";") + ";"
+        "# {MARK}\n[Desktop Entry]\nType=Service\nMimeType={mime_types}\nActions={}\n\
+         X-KDE-Submenu=HatchZip\nIcon={icon}\n",
+        actions.iter().map(|a| a.id).collect::<Vec<_>>().join(";") + ";"
     );
-    // Every selected archive goes to one window, which works through them
+    // Every selected path goes to one window, which works through them
     // one after another, checking the space for each just before it starts.
-    for a in ACTIONS {
+    for a in actions {
         kde.push_str(&format!(
-            "\n[Desktop Action {}]\nName={}\nIcon=archive-extract\nExec={exec} {} %F\n",
+            "\n[Desktop Action {}]\nName={}\nIcon={icon}\nExec={exec} {} %F\n",
             a.id, a.label, a.flag
         ));
     }
-    write(&kde_file(dirs), &kde, true)?;
+    kde
+}
 
+pub fn register(dirs: &Dirs, gui: &Path) -> Result<Vec<String>> {
+    let exec = exec_quote(gui);
+    let archive: Vec<&Action> = ACTIONS
+        .iter()
+        .filter(|a| a.on == Surface::Archive)
+        .collect();
+    let folder: Vec<&Action> = ACTIONS.iter().filter(|a| a.on == Surface::Folder).collect();
+
+    write(
+        &kde_file(dirs),
+        &kde_desktop(MIME_TYPES, "archive-extract", &archive, &exec),
+        true,
+    )?;
+    write(
+        &kde_folder_file(dirs),
+        &kde_desktop("inode/directory;", "archive-insert", &folder, &exec),
+        true,
+    )?;
+
+    // GNOME Files shows scripts on any selection, files and folders alike;
+    // it has nothing like a MIME filter, so the pack script shows on
+    // archives too and the GUI refuses them.
     for a in ACTIONS {
         // GNOME Files hands over every selected path, one per line. Split on
         // newlines only, with globbing off, so spaces and stars in names
@@ -107,13 +136,21 @@ pub fn register(dirs: &Dirs, gui: &Path) -> Result<Vec<String>> {
         );
         write(&nautilus_file(dirs, a.label), &script, true)?;
 
-        let nemo = format!(
-            "# {MARK}\n[Nemo Action]\nName={} with HatchZip\nIcon-Name=archive-extract\n\
-             Exec={exec} {} %F\nSelection=notnone\nExtensions={};\n",
-            a.label,
-            a.flag,
-            EXTENSIONS.join(";")
-        );
+        let nemo = match a.on {
+            Surface::Archive => format!(
+                "# {MARK}\n[Nemo Action]\nName={} with HatchZip\nIcon-Name=archive-extract\n\
+                 Exec={exec} {} %F\nSelection=notnone\nExtensions={};\n",
+                a.label,
+                a.flag,
+                EXTENSIONS.join(";")
+            ),
+            // `dir` is Nemo's name for a directory selection.
+            Surface::Folder => format!(
+                "# {MARK}\n[Nemo Action]\nName={} with HatchZip\nIcon-Name=archive-insert\n\
+                 Exec={exec} {} %F\nSelection=notnone\nExtensions=dir;\n",
+                a.label, a.flag
+            ),
+        };
         write(&nemo_file(dirs, a.id), &nemo, false)?;
     }
 
@@ -128,7 +165,7 @@ pub fn register(dirs: &Dirs, gui: &Path) -> Result<Vec<String>> {
 }
 
 pub fn unregister(dirs: &Dirs) -> Result<()> {
-    let mut paths = vec![kde_file(dirs)];
+    let mut paths = vec![kde_file(dirs), kde_folder_file(dirs)];
     for a in ACTIONS {
         paths.push(nautilus_file(dirs, a.label));
         paths.push(nemo_file(dirs, a.id));
@@ -145,5 +182,5 @@ pub fn unregister(dirs: &Dirs) -> Result<()> {
 }
 
 pub fn is_registered(dirs: &Dirs) -> bool {
-    kde_file(dirs).exists()
+    kde_file(dirs).exists() || kde_folder_file(dirs).exists()
 }

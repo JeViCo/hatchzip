@@ -11,12 +11,22 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
+/// What has to be selected for the action to be offered.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Surface {
+    /// An archive file, matched by extension.
+    Archive,
+    /// A folder; packing turns its contents into a sibling archive.
+    Folder,
+}
+
 pub struct Action {
     /// Stable identifier, used in file and registry key names.
     pub id: &'static str,
     pub label: &'static str,
     /// The GUI's flags, put before the archive paths.
     pub flag: &'static str,
+    pub on: Surface,
 }
 
 pub const ACTIONS: &[Action] = &[
@@ -25,26 +35,37 @@ pub const ACTIONS: &[Action] = &[
         id: "extract-files",
         label: "Extract files…",
         flag: "--extract-files",
+        on: Surface::Archive,
     },
     Action {
         id: "extract-here",
         label: "Extract here",
         flag: "--extract-here",
+        on: Surface::Archive,
     },
     Action {
         id: "extract-here-keep",
         label: "Extract here (keep archive)",
         flag: "--keep-archive --extract-here",
+        on: Surface::Archive,
     },
     Action {
         id: "extract-to",
         label: "Extract to a new folder",
         flag: "--extract-to",
+        on: Surface::Archive,
     },
     Action {
         id: "test",
         label: "Test archive",
         flag: "--test",
+        on: Surface::Archive,
+    },
+    Action {
+        id: "pack-here",
+        label: "Pack here (in place)",
+        flag: "--pack-here",
+        on: Surface::Folder,
     },
 ];
 

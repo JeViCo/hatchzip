@@ -10,7 +10,7 @@ use hatchzip_shell::{Dirs, is_registered, register};
 fn linux_menus_point_at_the_gui_and_go_away_cleanly() {
     use std::os::unix::fs::PermissionsExt;
 
-    use hatchzip_shell::{ACTIONS, unregister};
+    use hatchzip_shell::{ACTIONS, Surface, unregister};
 
     let tmp = tempfile::TempDir::new().unwrap();
     let dirs = Dirs {
@@ -25,7 +25,7 @@ fn linux_menus_point_at_the_gui_and_go_away_cleanly() {
 
     let kde = tmp.path().join("kio/servicemenus/hatchzip.desktop");
     let text = std::fs::read_to_string(&kde).unwrap();
-    for a in ACTIONS {
+    for a in ACTIONS.iter().filter(|a| a.on == Surface::Archive) {
         assert!(
             text.contains(&format!("Exec=\"{}\" {} %F", gui.display(), a.flag)),
             "{}",
@@ -42,6 +42,26 @@ fn linux_menus_point_at_the_gui_and_go_away_cleanly() {
         0o111
     );
 
+    let folders = tmp.path().join("kio/servicemenus/hatchzip-folders.desktop");
+    let text = std::fs::read_to_string(&folders).unwrap();
+    assert!(text.contains("MimeType=inode/directory;"));
+    assert!(text.contains("Actions=pack-here;"));
+    for a in ACTIONS.iter().filter(|a| a.on == Surface::Folder) {
+        assert!(
+            text.contains(&format!("Exec=\"{}\" {} %F", gui.display(), a.flag)),
+            "{}",
+            a.id
+        );
+    }
+    assert!(text.contains(
+        "Name=Pack here (in place)\nIcon=archive-insert\n\
+         Exec=\"/opt/Hatch Zip/it's/hatchzip-gui\" --pack-here %F"
+    ));
+    assert_eq!(
+        std::fs::metadata(&folders).unwrap().permissions().mode() & 0o111,
+        0o111
+    );
+
     let script = tmp.path().join("nautilus/scripts/HatchZip - Extract here");
     let text = std::fs::read_to_string(&script).unwrap();
     assert!(text.contains("'/opt/Hatch Zip/it'\\''s/hatchzip-gui' --extract-here"));
@@ -53,6 +73,14 @@ fn linux_menus_point_at_the_gui_and_go_away_cleanly() {
         std::fs::read_to_string(&keep)
             .unwrap()
             .contains("'/opt/Hatch Zip/it'\\''s/hatchzip-gui' --keep-archive --extract-here")
+    );
+    let pack = tmp
+        .path()
+        .join("nautilus/scripts/HatchZip - Pack here (in place)");
+    assert!(
+        std::fs::read_to_string(&pack)
+            .unwrap()
+            .contains("'/opt/Hatch Zip/it'\\''s/hatchzip-gui' --pack-here")
     );
 
     let nemo = tmp.path().join("nemo/actions/hatchzip-test.nemo_action");
@@ -67,6 +95,12 @@ fn linux_menus_point_at_the_gui_and_go_away_cleanly() {
     let text = std::fs::read_to_string(&nemo).unwrap();
     assert!(text.contains("Name=Extract here (keep archive) with HatchZip"));
     assert!(text.contains("--keep-archive --extract-here %F\nSelection=notnone\n"));
+    let nemo = tmp
+        .path()
+        .join("nemo/actions/hatchzip-pack-here.nemo_action");
+    let text = std::fs::read_to_string(&nemo).unwrap();
+    assert!(text.contains("Name=Pack here (in place) with HatchZip"));
+    assert!(text.contains("--pack-here %F\nSelection=notnone\nExtensions=dir;\n"));
 
     // Running it twice is harmless, and so is unregistering twice.
     register(&dirs, gui).unwrap();
@@ -143,7 +177,7 @@ fn walk(dir: &Path) -> Vec<std::path::PathBuf> {
 #[cfg(windows)]
 #[test]
 fn explorer_menu_points_at_the_gui_and_goes_away_cleanly() {
-    use hatchzip_shell::{ACTIONS, unregister};
+    use hatchzip_shell::{ACTIONS, Surface, unregister};
     use winreg::RegKey;
     use winreg::enums::HKEY_CURRENT_USER;
 
@@ -151,6 +185,7 @@ fn explorer_menu_points_at_the_gui_and_goes_away_cleanly() {
     let gui = Path::new(r"C:\Program Files\Hatch Zip\hatchzip-gui.exe");
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     let base = r"Software\Classes\SystemFileAssociations";
+    let directory = r"Software\Classes\Directory";
 
     register(&dirs, gui).unwrap();
     assert!(is_registered(&dirs));
@@ -159,12 +194,36 @@ fn explorer_menu_points_at_the_gui_and_goes_away_cleanly() {
             .open_subkey(format!(r"{base}\.{ext}\shell\HatchZip"))
             .unwrap();
         assert_eq!(menu.get_value::<String, _>("MUIVerb").unwrap(), "HatchZip");
-        for (i, a) in ACTIONS.iter().enumerate() {
+        for (i, a) in ACTIONS
+            .iter()
+            .filter(|a| a.on == Surface::Archive)
+            .enumerate()
+        {
             let cmd = menu
                 .open_subkey(format!(r"shell\{:02}{}\command", i + 1, a.id))
                 .unwrap();
             let line: String = cmd.get_value("").unwrap();
             assert_eq!(line, format!("\"{}\" {} \"%1\"", gui.display(), a.flag));
+        }
+    }
+
+    // The menu on the folder itself and on the empty space inside it: same
+    // submenu, but the background command names the open folder with %V.
+    for (leaf, target) in [(r"shell", "\"%1\""), (r"Background\shell", "%V")] {
+        let menu = hkcu
+            .open_subkey(format!(r"{directory}\{leaf}\HatchZip"))
+            .unwrap();
+        assert_eq!(menu.get_value::<String, _>("MUIVerb").unwrap(), "HatchZip");
+        for (i, a) in ACTIONS
+            .iter()
+            .filter(|a| a.on == Surface::Folder)
+            .enumerate()
+        {
+            let cmd = menu
+                .open_subkey(format!(r"shell\{:02}{}\command", i + 1, a.id))
+                .unwrap();
+            let line: String = cmd.get_value("").unwrap();
+            assert_eq!(line, format!("\"{}\" {} {}", gui.display(), a.flag, target));
         }
     }
 
@@ -174,6 +233,12 @@ fn explorer_menu_points_at_the_gui_and_goes_away_cleanly() {
     for ext in hatchzip_shell::EXTENSIONS {
         assert!(
             hkcu.open_subkey(format!(r"{base}\.{ext}\shell\HatchZip"))
+                .is_err()
+        );
+    }
+    for leaf in [r"shell", r"Background\shell"] {
+        assert!(
+            hkcu.open_subkey(format!(r"{directory}\{leaf}\HatchZip"))
                 .is_err()
         );
     }
