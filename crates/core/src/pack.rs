@@ -537,27 +537,7 @@ fn resume(
     stop: &AtomicBool,
     progress: Progress,
 ) -> Result<Outcome> {
-    let journal = load(paths)?;
-    if !fsutil::same_path(&journal.source, source) {
-        bail!(
-            "this half-packed archive belongs to '{}', not '{}'. \
-             Pack that folder to finish it",
-            fsutil::plain(&journal.source).display(),
-            fsutil::plain(source).display()
-        );
-    }
-    let rows = read_list(paths, &journal)?;
-    let blocks = read_index(paths, &journal, &rows)?;
-
-    let archive = open_locked(&paths.target)?;
-    let len = archive.metadata()?.len();
-    if len < journal.committed_len {
-        bail!(
-            "'{}' is shorter than its journal says. Nothing can be told about it",
-            fsutil::plain(&paths.target).display()
-        );
-    }
-    archive.set_len(journal.committed_len)?;
+    let (journal, rows, blocks, archive) = open_pack(paths, source)?;
 
     // Files a crashed run packed and journaled but never deleted.
     for row in rows
@@ -599,6 +579,34 @@ fn resume(
         },
         blocks,
     )
+}
+
+/// Everything a resumed or finished pack needs, checked before anything
+/// changes: the journal belongs to `source`, the list and the index match
+/// it, and the archive ends exactly at the committed length.
+fn open_pack(paths: &Paths, source: &Path) -> Result<(Journal, Vec<Row>, Vec<Block>, File)> {
+    let journal = load(paths)?;
+    if !fsutil::same_path(&journal.source, source) {
+        bail!(
+            "this half-packed archive belongs to '{}', not '{}'. \
+             Pack that folder to finish it",
+            fsutil::plain(&journal.source).display(),
+            fsutil::plain(source).display()
+        );
+    }
+    let rows = read_list(paths, &journal)?;
+    let blocks = read_index(paths, &journal, &rows)?;
+
+    let archive = open_locked(&paths.target)?;
+    let len = archive.metadata()?.len();
+    if len < journal.committed_len {
+        bail!(
+            "'{}' is shorter than its journal says. Nothing can be told about it",
+            fsutil::plain(&paths.target).display()
+        );
+    }
+    archive.set_len(journal.committed_len)?;
+    Ok((journal, rows, blocks, archive))
 }
 
 /// The rows of the files a pack compresses, in the order the manifest
@@ -705,8 +713,13 @@ fn one_batch(s: &mut Session, batch: &[usize], solo: bool) -> Result<Vec<Block>>
         let row = s.rows[batch[0]].clone();
         let path = s.row_path(&row.name);
         check_still(&row, &path)?;
-        let src = File::open(&path)
-            .with_context(|| format!("reading {}", fsutil::plain(&path).display()))?;
+        let src = File::open(&path).with_context(|| {
+            format!(
+                "reading {}. If it is gone for good, keep what is packed so far with \
+                 `hatchzip pack <folder> --finish`",
+                fsutil::plain(&path).display()
+            )
+        })?;
         s.archive.seek(SeekFrom::Start(start_len))?;
         let block = sevenz::stream(src, &mut s.archive, sevenz::dictionary_for(row.size))
             .with_context(|| format!("packing {}", fsutil::plain(&path).display()))?;
@@ -718,8 +731,13 @@ fn one_batch(s: &mut Session, batch: &[usize], solo: bool) -> Result<Vec<Block>>
             .map(|&i| {
                 let row = &s.rows[i];
                 let path = s.source.join(&row.name);
-                let src = File::open(&path)
-                    .with_context(|| format!("reading {}", fsutil::plain(&path).display()))?;
+                let src = File::open(&path).with_context(|| {
+                    format!(
+                        "reading {}. If it is gone for good, keep what is packed so far with \
+                         `hatchzip pack <folder> --finish`",
+                        fsutil::plain(&path).display()
+                    )
+                })?;
                 let (block, bytes) = sevenz::compress(src, sevenz::dictionary_for(row.size))
                     .with_context(|| format!("packing {}", fsutil::plain(&path).display()))?;
                 Ok((i, block, bytes))
@@ -787,8 +805,9 @@ fn check_still(row: &Row, path: &Path) -> Result<()> {
         .with_context(|| format!("reading {}", fsutil::plain(path).display()))?;
     if meta.len() != row.size || meta.modified().ok().and_then(filetime) != row.mtime {
         bail!(
-            "'{}' changed while it was being packed. Nothing was deleted; \
-             pack it again once it is still",
+            "'{}' changed while it was being packed. Nothing was deleted; pack it again \
+             once it is still, or keep what is packed so far with \
+             `hatchzip pack <folder> --finish`",
             fsutil::plain(path).display()
         );
     }
@@ -796,35 +815,8 @@ fn check_still(row: &Row, path: &Path) -> Result<()> {
 }
 
 fn finalize(s: &mut Session, blocks: &[Block]) -> Result<()> {
-    let entries: Vec<Entry> = s
-        .rows
-        .iter()
-        .map(|r| Entry {
-            name: r.name.clone(),
-            is_dir: r.is_dir,
-            size: r.size,
-            mtime: r.mtime,
-            mode: r.mode.map(|m| 0x8000 | (m << 16)),
-        })
-        .collect();
-    let header = sevenz::end_header(&entries, blocks);
-    s.archive.seek(SeekFrom::End(0))?;
-    s.archive
-        .write_all(&header)
-        .with_context(|| format!("writing {}", fsutil::plain(&s.paths.target).display()))?;
-    // The end of the archive is where the header stopped, not where the
-    // start-header patch leaves the write position. It is the length a
-    // resume must trust, so it is taken before the patch seek moves.
-    let end = s.archive.stream_position()?;
-    let header_at = end - header.len() as u64;
-    let patch = sevenz::start_patch(header_at, &header);
-    s.archive.seek(SeekFrom::Start(8))?;
-    s.archive
-        .write_all(&patch)
-        .with_context(|| format!("writing {}", fsutil::plain(&s.paths.target).display()))?;
-    s.archive
-        .sync_all()
-        .with_context(|| format!("flushing {}", fsutil::plain(&s.paths.target).display()))?;
+    let entries: Vec<Entry> = s.rows.iter().map(row_entry).collect();
+    let end = write_header(&mut s.archive, &s.paths.target, &entries, blocks)?;
 
     let journal = Journal {
         finished: true,
@@ -834,6 +826,134 @@ fn finalize(s: &mut Session, blocks: &[Block]) -> Result<()> {
     save(&s.paths, &journal)?;
     s.journal = journal;
     Ok(())
+}
+
+/// The header's form of a walk row.
+fn row_entry(r: &Row) -> Entry {
+    Entry {
+        name: r.name.clone(),
+        is_dir: r.is_dir,
+        size: r.size,
+        mtime: r.mtime,
+        mode: r.mode.map(|m| 0x8000 | (m << 16)),
+    }
+}
+
+/// Appends the end header for `entries` and their `blocks` and points the
+/// start header at it. Returns the archive length once both are durable,
+/// which is what a resume trusts.
+fn write_header(
+    archive: &mut File,
+    target: &Path,
+    entries: &[Entry],
+    blocks: &[Block],
+) -> Result<u64> {
+    let header = sevenz::end_header(entries, blocks);
+    archive.seek(SeekFrom::End(0))?;
+    archive
+        .write_all(&header)
+        .with_context(|| format!("writing {}", fsutil::plain(target).display()))?;
+    // The end of the archive is where the header stopped, not where the
+    // start-header patch leaves the write position. It is the length a
+    // resume must trust, so it is taken before the patch seek moves.
+    let end = archive.stream_position()?;
+    let header_at = end - header.len() as u64;
+    let patch = sevenz::start_patch(header_at, &header);
+    archive.seek(SeekFrom::Start(8))?;
+    archive
+        .write_all(&patch)
+        .with_context(|| format!("writing {}", fsutil::plain(target).display()))?;
+    archive
+        .sync_all()
+        .with_context(|| format!("flushing {}", fsutil::plain(target).display()))?;
+    Ok(end)
+}
+
+/// What finishing early kept, and where the rest of the folder stands.
+pub struct Finished {
+    pub target: PathBuf,
+    /// The files the archive holds, and the files the walk saw.
+    pub packed: u64,
+    pub total: u64,
+    pub bytes: u64,
+}
+
+/// Ends a pack in progress the only way short of finishing it: everything
+/// packed so far becomes a readable 7z, and everything the walk had not
+/// reached stays in the folder, untouched. The journal goes away, so this
+/// is not undoable either; nothing is deleted, so nothing is lost.
+pub fn finish(source: &Path, target: Option<&Path>) -> Result<Finished> {
+    let source = fs::canonicalize(source)
+        .with_context(|| format!("finding {}", fsutil::plain(source).display()))?;
+    let target = match target {
+        Some(t) => std::path::absolute(t)
+            .with_context(|| format!("reading the path {}", fsutil::plain(t).display()))?,
+        None => target_for(&source)?,
+    };
+    let paths = Paths::for_target(&target);
+    if !paths.journal.exists() {
+        bail!(
+            "there is no pack in progress beside '{}', so there is nothing to finish early",
+            fsutil::plain(&target).display()
+        );
+    }
+    let (mut journal, rows, blocks, mut archive) = open_pack(&paths, &source)?;
+    if journal.finished {
+        bail!(
+            "'{}' is already whole. Run `hatchzip pack` on '{}' without --finish to delete \
+             the folder and be done",
+            fsutil::plain(&paths.target).display(),
+            fsutil::plain(&source).display()
+        );
+    }
+    let data = data_rows(&rows);
+    let packed = blocks.len() as u64;
+
+    // Nothing is packed yet, so the half-made archive holds nothing and
+    // the folder is untouched: finishing here only means cancelling.
+    if packed == 0 {
+        drop(archive);
+        fs::remove_file(&paths.target)
+            .with_context(|| format!("removing {}", fsutil::plain(&paths.target).display()))?;
+        let _ = fs::remove_file(&paths.index);
+        let _ = fs::remove_file(&paths.list);
+        chosen::forget(&paths.target);
+        fs::remove_file(&paths.journal)
+            .with_context(|| format!("removing {}", fsutil::plain(&paths.journal).display()))?;
+        return Ok(Finished {
+            target,
+            packed: 0,
+            total: data.len() as u64,
+            bytes: 0,
+        });
+    }
+
+    let entries: Vec<Entry> = rows
+        .iter()
+        .filter(|r| !r.is_dir && r.size > 0)
+        .take(blocks.len())
+        .map(row_entry)
+        .collect();
+    let end = write_header(&mut archive, &paths.target, &entries, &blocks)?;
+
+    journal.finished = true;
+    journal.committed_len = end;
+    save(&paths, &journal)?;
+    drop(archive);
+
+    // The folder stays: whatever was not packed is still in it, and the
+    // archive is opened over it like any other 7z.
+    let _ = fs::remove_file(&paths.index);
+    let _ = fs::remove_file(&paths.list);
+    chosen::forget(&paths.target);
+    fs::remove_file(&paths.journal)
+        .with_context(|| format!("removing {}", fsutil::plain(&paths.journal).display()))?;
+    Ok(Finished {
+        target,
+        packed,
+        total: data.len() as u64,
+        bytes: journal.bytes_done,
+    })
 }
 
 /// Deletes what the finished archive has already taken: the empty files,
