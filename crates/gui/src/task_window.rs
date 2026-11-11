@@ -1,8 +1,8 @@
 //! The small window behind "Extract here", "Extract to a folder", "Extract
-//! files" and "Test". The right-click was the confirmation, so it starts as
-//! soon as it shows, unless the space check says no. Several archives run one
-//! after another, each checked just before it starts; one that doesn't
-//! finish stops the rest until it is resumed.
+//! files", "Pack here" and "Test". The right-click was the confirmation, so
+//! it starts as soon as it shows, unless the space check says no. Several
+//! archives run one after another, each checked just before it starts; one
+//! that doesn't finish stops the rest until it is resumed.
 
 use std::path::{Path, PathBuf};
 
@@ -24,6 +24,11 @@ pub fn output_for(kind: &TaskKind, primary: &Path) -> Option<PathBuf> {
         TaskKind::ExtractHere => Some(primary.parent().unwrap_or(Path::new(".")).to_path_buf()),
         TaskKind::ExtractTo => Some(session::default_output(primary)),
         TaskKind::ExtractFiles(folder) => folder.clone(),
+        // The destination of a pack is the archive that appears beside the
+        // folder, written the way a person spells the path.
+        TaskKind::PackHere => hatchzip_core::pack::target_for(primary)
+            .ok()
+            .map(|t| hatchzip_core::pack::shown(&t)),
         TaskKind::Test => None,
     }
 }
@@ -69,6 +74,15 @@ fn job_for(
         .to_string_lossy()
         .into_owned();
     let archive = archive.to_path_buf();
+    if *kind == TaskKind::PackHere {
+        return (
+            Task::pack(&name, output_for(kind, &primary).as_deref()),
+            Request::Pack {
+                source: archive,
+                keep_free: settings.keep_free,
+            },
+        );
+    }
     match output_for(kind, &primary) {
         Some(out) => (
             Task::extract(&name, Some(&out), keep_archive),
@@ -114,7 +128,36 @@ pub fn build(args: TaskArgs, settings: Settings) -> Result<(TaskWindow, impl FnO
     let weak = ui.as_weak();
     let runner = Runner::install(move |task: &Task| {
         if let Some(ui) = weak.upgrade() {
-            ui.set_task(task.view.clone());
+            let mut view = task.view.clone();
+            if task.is_packing() {
+                // The same strings the main window translates, marked in
+                // this component so the catalog covers them.
+                view.heading = ui.invoke_pack_heading(view.phase, task.name().into());
+                if let Some(target) = &task.packed_into {
+                    view.detail = ui.invoke_task_destination(target.display().to_string().into());
+                }
+                match view.phase {
+                    crate::Phase::Paused => view.message = ui.invoke_pack_paused(),
+                    crate::Phase::Done => {
+                        let warning = task
+                            .warning
+                            .as_ref()
+                            .map(|w| format!("{w}."))
+                            .unwrap_or_default();
+                        let target = task
+                            .packed_into
+                            .as_ref()
+                            .map(|t| t.display().to_string())
+                            .unwrap_or_default();
+                        view.message = ui.invoke_packed_result(target.into(), warning.into());
+                    }
+                    _ => {}
+                }
+                if let Some(reason) = &task.resumable_failure {
+                    view.message = ui.invoke_pack_resumable(reason.as_str().into());
+                }
+            }
+            ui.set_task(view);
             ui.set_plan(task.plan.clone());
         }
     });
@@ -184,5 +227,11 @@ mod tests {
             Some(chosen)
         );
         assert_eq!(output_for(&TaskKind::Test, primary), None);
+        // Packing goes beside the folder, under its name.
+        let folder = Path::new("/home/me/Downloads/game");
+        assert_eq!(
+            output_for(&TaskKind::PackHere, folder),
+            Some(PathBuf::from("/home/me/Downloads/game.7z"))
+        );
     }
 }

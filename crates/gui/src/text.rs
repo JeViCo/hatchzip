@@ -84,6 +84,15 @@ pub fn gb_text(bytes: u64) -> String {
     }
 }
 
+/// Why a pack does not fit, in the words of an extraction's plan.
+pub fn refusal(needed: u64, avail: u64) -> String {
+    let short = needed.saturating_sub(avail);
+    format!(
+        "Insufficient disk space. {} more is required.",
+        human(short)
+    )
+}
+
 pub fn plan_view(plan: &SpacePlan) -> PlanView {
     let verdict = if plan.fits {
         "Sufficient disk space".to_string()

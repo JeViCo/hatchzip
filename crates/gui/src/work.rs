@@ -1,5 +1,6 @@
-//! What runs on the worker thread: the same steps as `hatchzip extract` and
-//! `hatchzip test`, reporting through [`Update`]s instead of printing.
+//! What runs on the worker thread: the same steps as `hatchzip extract`,
+//! `hatchzip test` and `hatchzip pack`, reporting through [`Update`]s
+//! instead of printing.
 //!
 //! Byte counts go through atomics that the UI samples on a timer, so a fast
 //! extraction never floods the event loop with one message per write.
@@ -58,6 +59,9 @@ pub enum Request {
         archive: PathBuf,
         password: Option<String>,
     },
+    /// Packs the folder into the archive that appears beside it. No
+    /// password: a fresh 7z is written without one.
+    Pack { source: PathBuf, keep_free: u64 },
     /// Stops for good: turns a half-extracted archive back into a normal one.
     Restore { archive: PathBuf },
 }
@@ -68,13 +72,16 @@ impl Request {
             Self::Extract { archive, .. }
             | Self::Test { archive, .. }
             | Self::Restore { archive } => archive,
+            // The source stands in: a pack is never restored, and the
+            // restore request is never built for one.
+            Self::Pack { source, .. } => source,
         }
     }
 
     pub fn password(&self) -> Option<&str> {
         match self {
             Self::Extract { password, .. } | Self::Test { password, .. } => password.as_deref(),
-            Self::Restore { .. } => None,
+            Self::Pack { .. } | Self::Restore { .. } => None,
         }
     }
 
@@ -83,7 +90,7 @@ impl Request {
     pub fn set_password(&mut self, p: String) {
         match self {
             Self::Extract { password, .. } | Self::Test { password, .. } => *password = Some(p),
-            Self::Restore { .. } => {}
+            Self::Pack { .. } | Self::Restore { .. } => {}
         }
     }
 }
@@ -105,7 +112,13 @@ pub enum Update {
     Unlocked(String),
     /// It fits; shown while the run starts.
     Planned(SpacePlan),
-    NoSpace(SpacePlan),
+    /// The run does not fit. An extraction reports its whole plan; a pack
+    /// refuses with just the two numbers, which is all its check says.
+    NoSpace {
+        plan: Option<SpacePlan>,
+        needed: u64,
+        avail: u64,
+    },
     /// Reading every file to check it; nothing is written.
     Verifying,
     /// Extraction has started, into this folder, keeping the archive or not.
@@ -113,10 +126,20 @@ pub enum Update {
         output: PathBuf,
         keep: bool,
     },
+    /// Packing has started, into this archive beside the folder.
+    Packing {
+        output: PathBuf,
+    },
     Paused,
     Extracted {
         output: PathBuf,
         keep: bool,
+        warning: Option<String>,
+    },
+    /// The folder is fully packed into this archive, with a warning for
+    /// whatever could not be done at the end.
+    Packed {
+        target: PathBuf,
         warning: Option<String>,
     },
     Tested(usize),
@@ -184,11 +207,24 @@ pub fn run(
             counters,
             send,
         ),
+        Request::Pack { source, keep_free } => pack(source, *keep_free, counters, send),
         Request::Restore { archive } => restore(archive, send),
     };
     if let Err(e) = result {
-        let resumable = matches!(request, Request::Extract { .. })
-            && session::locate(request.archive()).is_ok_and(|(_, paths)| paths.exists());
+        let resumable = match request {
+            Request::Extract { .. } => {
+                session::locate(request.archive()).is_ok_and(|(_, paths)| paths.exists())
+            }
+            // A pack continues from the journal beside its archive.
+            Request::Pack { source, .. } => {
+                hatchzip_core::pack::target_for(source).is_ok_and(|target| {
+                    let mut journal = target.into_os_string();
+                    journal.push(".hatchzip");
+                    Path::new(&journal).exists()
+                })
+            }
+            _ => false,
+        };
         let message = if e.is::<PasswordNeeded>() || e.is::<WrongPassword>() {
             // Only reached when the person closed the password prompt.
             match request {
@@ -288,7 +324,7 @@ fn extract(
             let keep = session::keeps_archive(&journal, keep_archive)?;
             let plan = session::plan(&job, &journal.output, true, keep_free, keep)?;
             if !plan.fits {
-                send(Update::NoSpace(plan));
+                send(no_space(plan));
                 return Ok(());
             }
             send(Update::Planned(plan));
@@ -319,7 +355,7 @@ fn extract(
             };
             let plan = session::plan(&job, &out, false, keep_free, keep_archive)?;
             if !plan.fits {
-                send(Update::NoSpace(plan));
+                send(no_space(plan));
                 return Ok(());
             }
             send(Update::Planned(plan));
@@ -410,6 +446,79 @@ fn test(
     sfv?;
     verify(&job, counters, send).context("the archive is damaged")?;
     send(Update::Tested(job.item_count()));
+    Ok(())
+}
+
+/// The extract-flavoured refusal, carrying the plan the window shows.
+fn no_space(plan: SpacePlan) -> Update {
+    Update::NoSpace {
+        needed: plan.needed,
+        avail: plan.free,
+        plan: Some(plan),
+    }
+}
+
+fn pack(
+    source: &Path,
+    keep_free: u64,
+    counters: &Arc<Counters>,
+    send: &dyn Fn(Update),
+) -> Result<()> {
+    send(Update::Checking);
+    let target = hatchzip_core::pack::target_for(source)?;
+    // The bar needs the folder's size before the run starts; a resumed pack
+    // reads both numbers from its journal instead of walking the folder.
+    if let Some((done, total)) = hatchzip_core::pack::progress_of(&target) {
+        counters.total.store(total, Ordering::Relaxed);
+        counters.done.store(done, Ordering::Relaxed);
+    } else {
+        let plan = hatchzip_core::pack::space_plan(source, &target, keep_free)?;
+        counters.total.store(plan.bytes, Ordering::Relaxed);
+        // The engine refuses the same way; saying it here keeps the folder
+        // untouched and skips the pointless run.
+        if !plan.fits {
+            send(Update::NoSpace {
+                plan: None,
+                needed: plan.needs,
+                avail: plan.avail,
+            });
+            return Ok(());
+        }
+    }
+    send(Update::Packing {
+        output: hatchzip_core::pack::shown(&target),
+    });
+    let c1 = counters.clone();
+    let progress = Progress {
+        // Cumulative bytes packed, like the CLI's bar position.
+        on_bytes: Box::new(move |n| c1.done.store(n, Ordering::Relaxed)),
+        // A pack never commits through this callback; its files just
+        // disappear one batch at a time.
+        on_commit: Box::new(|_| {}),
+    };
+    match hatchzip_core::pack::pack(source, None, keep_free, &counters.stop, progress) {
+        Ok(Outcome::Finished(warning)) => {
+            send(Update::Packed {
+                target: hatchzip_core::pack::shown(&target),
+                warning,
+            });
+        }
+        Ok(Outcome::Paused) => send(Update::Paused),
+        Err(e) => {
+            if e.is::<hatchzip_core::pack::NoSpace>() {
+                let ns = e
+                    .downcast::<hatchzip_core::pack::NoSpace>()
+                    .expect("checked above");
+                send(Update::NoSpace {
+                    plan: None,
+                    needed: ns.needed,
+                    avail: ns.avail,
+                });
+                return Ok(());
+            }
+            return Err(e);
+        }
+    }
     Ok(())
 }
 
@@ -523,13 +632,18 @@ mod tests {
             Update::Checking => "checking".to_string(),
             Update::Unlocked(p) => format!("unlocked {p}"),
             Update::Planned(_) => "planned".to_string(),
-            Update::NoSpace(_) => "no space".to_string(),
+            Update::NoSpace { .. } => "no space".to_string(),
             Update::Verifying => "verifying".to_string(),
             Update::Working { keep: false, .. } => "working".to_string(),
             Update::Working { keep: true, .. } => "working, keeping the archive".to_string(),
+            Update::Packing { .. } => "packing".to_string(),
             Update::Paused => "paused".to_string(),
             Update::Extracted { keep: false, .. } => "extracted".to_string(),
             Update::Extracted { keep: true, .. } => "extracted, archive kept".to_string(),
+            Update::Packed { warning: None, .. } => "packed".to_string(),
+            Update::Packed {
+                warning: Some(w), ..
+            } => format!("packed, warning {w}"),
             Update::Tested(n) => format!("tested {n}"),
             Update::Restored {
                 entries,
@@ -881,6 +995,82 @@ mod tests {
         };
         assert_eq!(collect(&request, &counters), ["checking", "no space"]);
         assert!(!session::locate(&archive).unwrap().1.exists());
+    }
+
+    /// A folder with files at the top and below packs into the archive
+    /// beside it, and the files go as the archive takes them.
+    #[test]
+    fn a_folder_packs_into_the_archive_beside_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("game");
+        std::fs::create_dir_all(source.join("data")).unwrap();
+        std::fs::write(source.join("data/file1.bin"), vec![1u8; 50_000]).unwrap();
+        std::fs::write(source.join("data/file2.bin"), vec![2u8; 50_000]).unwrap();
+        std::fs::write(source.join("top.txt"), b"top").unwrap();
+        let counters = Arc::new(Counters::default());
+        let request = Request::Pack {
+            source: source.clone(),
+            keep_free: 0,
+        };
+
+        assert_eq!(
+            collect(&request, &counters),
+            ["checking", "packing", "packed"]
+        );
+        assert!(!source.exists(), "the folder went with its files");
+        assert!(dir.path().join("game.7z").exists());
+        assert!(!dir.path().join("game.7z.hatchzip").exists());
+        assert_eq!(
+            counters.done.load(Ordering::Relaxed),
+            counters.total.load(Ordering::Relaxed)
+        );
+    }
+
+    /// The stop flag reaches the engine: the pack stops between batches and
+    /// a rerun picks up from its journal.
+    #[test]
+    fn a_paused_pack_resumes_and_finishes() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("game");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("file.bin"), vec![7u8; 50_000]).unwrap();
+        let counters = Arc::new(Counters::default());
+        let request = Request::Pack {
+            source: source.clone(),
+            keep_free: 0,
+        };
+
+        counters.stop.store(true, Ordering::Relaxed);
+        assert_eq!(
+            collect(&request, &counters),
+            ["checking", "packing", "paused"]
+        );
+        assert!(source.exists(), "paused before anything was deleted");
+        assert!(dir.path().join("game.7z.hatchzip").exists());
+
+        counters.reset();
+        assert_eq!(
+            collect(&request, &counters),
+            ["checking", "packing", "packed"]
+        );
+        assert!(!source.exists());
+        assert!(!dir.path().join("game.7z.hatchzip").exists());
+    }
+
+    #[test]
+    fn a_pack_that_does_not_fit_starts_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("game");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("file.bin"), vec![7u8; 50_000]).unwrap();
+        let counters = Arc::new(Counters::default());
+        let request = Request::Pack {
+            source,
+            keep_free: u64::MAX / 4,
+        };
+        assert_eq!(collect(&request, &counters), ["checking", "no space"]);
+        assert!(!dir.path().join("game.7z").exists());
+        assert!(!dir.path().join("game.7z.hatchzip").exists());
     }
 
     #[test]

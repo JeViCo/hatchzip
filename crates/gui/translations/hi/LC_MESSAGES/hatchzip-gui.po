@@ -376,3 +376,27 @@ msgstr "लिंक"
 
 msgid "{}. Turn off \"Remove the archive during extraction\" to extract it and keep the archive"
 msgstr "{}। आर्काइव को रखते हुए एक्सट्रैक्ट करने के लिए \"एक्सट्रैक्शन के दौरान आर्काइव हटाएँ\" बंद करें।"
+
+msgid "Pack complete"
+msgstr "पैक पूरा हुआ"
+
+msgid "Pack failed"
+msgstr "पैक विफल हुआ"
+
+msgid "Pack paused"
+msgstr "पैक रुका हुआ"
+
+msgid "Packing {}"
+msgstr "{} पैक हो रहा है"
+
+msgid "Progress is saved. The pack can be resumed now or later."
+msgstr "प्रगति सहेज ली गई है। पैक अभी या बाद में फिर शुरू किया जा सकता है।"
+
+msgid "{} Progress is saved; the pack can be resumed."
+msgstr "{} प्रगति सहेजी गई है; पैक फिर शुरू किया जा सकता है।"
+
+msgid "The folder was packed into {}."
+msgstr "फ़ोल्डर {} में पैक किया गया।"
+
+msgid "The folder was packed into {}. {}"
+msgstr "फ़ोल्डर {} में पैक किया गया। {}"

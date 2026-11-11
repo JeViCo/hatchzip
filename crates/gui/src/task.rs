@@ -25,9 +25,14 @@ pub struct Task {
     pub resumable_failure: Option<String>,
     /// What the finished run could not do, shown after its result.
     pub warning: Option<String>,
+    /// For a pack, the archive being built; `output` stays its folder,
+    /// where the open-folder button goes.
+    pub packed_into: Option<PathBuf>,
     name: String,
     is_test: bool,
     restoring: bool,
+    /// The run packs a folder instead of extracting an archive.
+    packing: bool,
     /// The last failure left a journal, so the archive is partly out.
     resumable: bool,
     /// The extraction keeps the archive: nothing to count down, nothing to
@@ -67,6 +72,22 @@ impl Task {
         task
     }
 
+    /// Packing a folder into the archive that appears beside it. The folder
+    /// itself is what goes away, so the open-folder button points one level
+    /// up, at the archive's folder.
+    pub fn pack(name: &str, target: Option<&Path>) -> Self {
+        let mut task = Self::new(false, name);
+        task.packing = true;
+        // new() computed the heading before the run knew it was a pack.
+        task.view.heading = task.heading().into();
+        if let Some(t) = target {
+            task.packed_into = Some(t.to_path_buf());
+            task.view.detail = format!("Destination: {}", t.display()).into();
+            task.output = t.parent().map(Path::to_path_buf);
+        }
+        task
+    }
+
     pub fn test(name: &str) -> Self {
         let mut task = Self::new(true, name);
         task.view.detail = "Verifying every entry. No files are written.".into();
@@ -91,9 +112,11 @@ impl Task {
             restore_result: None,
             resumable_failure: None,
             warning: None,
+            packed_into: None,
             name: name.to_string(),
             is_test,
             restoring: false,
+            packing: false,
             resumable: false,
             keep: false,
             rate: Rate::default(),
@@ -112,6 +135,10 @@ impl Task {
         self.restoring
     }
 
+    pub fn is_packing(&self) -> bool {
+        self.packing
+    }
+
     pub fn keeps_archive(&self) -> bool {
         self.keep
     }
@@ -127,6 +154,15 @@ impl Task {
                 Phase::Done => "Restore complete".to_string(),
                 Phase::Failed => "Restore failed".to_string(),
                 _ => format!("Restoring {n}"),
+            };
+        }
+        if self.packing {
+            return match self.view.phase {
+                Phase::Done => "Pack complete".to_string(),
+                Phase::Paused => "Pack paused".to_string(),
+                Phase::Failed => "Pack failed".to_string(),
+                Phase::NoSpace => "Insufficient disk space".to_string(),
+                _ => format!("Packing {n}"),
             };
         }
         match (self.is_test, self.view.phase) {
@@ -189,6 +225,7 @@ impl Task {
                 self.restore_result = None;
                 self.resumable_failure = None;
                 self.warning = None;
+                self.packed_into = None;
                 v.fraction = 0.0;
                 v.amounts = "".into();
                 v.rate = "".into();
@@ -206,10 +243,25 @@ impl Task {
                 )
                 .into();
             }
-            Update::NoSpace(plan) => {
-                self.plan = plan_view(&plan);
+            Update::NoSpace {
+                plan,
+                needed,
+                avail,
+            } => {
+                match plan {
+                    Some(plan) => {
+                        self.plan = plan_view(&plan);
+                        v.message = self.plan.verdict.clone();
+                    }
+                    // A pack's refusal says only the two numbers.
+                    None => {
+                        v.message = crate::text::refusal(needed, avail).into();
+                        v.space =
+                            format!("Required: {}. Available: {}.", human(needed), human(avail))
+                                .into();
+                    }
+                }
                 v.phase = Phase::NoSpace;
-                v.message = self.plan.verdict.clone();
                 v.can_retry = true;
             }
             Update::Verifying => {
@@ -224,6 +276,15 @@ impl Task {
                 self.keep = keep;
                 self.rate.clear();
                 self.set_output(&output);
+            }
+            Update::Packing { output } => {
+                v.phase = Phase::Working;
+                self.rate.clear();
+                self.packed_into = Some(output.clone());
+                v.detail = format!("Destination: {}", output.display()).into();
+                // The open-folder button goes to the archive's folder; the
+                // archive itself is not something to open.
+                self.output = output.parent().map(Path::to_path_buf);
             }
             Update::Paused => {
                 v.phase = Phase::Paused;
@@ -249,6 +310,20 @@ impl Task {
                 .into();
                 v.can_open_folder = true;
                 self.set_output(&output);
+            }
+            Update::Packed { target, warning } => {
+                self.warning = warning;
+                self.packed_into = Some(target.clone());
+                v.phase = Phase::Done;
+                v.fraction = 1.0;
+                v.rate = "".into();
+                v.archive_left = "".into();
+                let mut message = format!("The folder was packed into {}.", target.display());
+                if let Some(warning) = &self.warning {
+                    message = format!("{message} {warning}.");
+                }
+                v.message = message.into();
+                v.can_open_folder = true;
             }
             Update::Tested(entries) => {
                 self.tested_entries = Some(entries);
@@ -302,10 +377,14 @@ impl Task {
                 v.phase = Phase::Failed;
                 v.rate = "".into();
                 v.message = if f.resumable {
-                    format!(
-                        "{} Progress is saved; the extraction can be resumed.",
-                        f.message
-                    )
+                    if self.packing {
+                        format!("{} Progress is saved; the pack can be resumed.", f.message)
+                    } else {
+                        format!(
+                            "{} Progress is saved; the extraction can be resumed.",
+                            f.message
+                        )
+                    }
                 } else {
                     f.message
                 }
@@ -316,9 +395,11 @@ impl Task {
         }
         self.view.heading = self.heading().into();
         // Half extracted and not running: the archive can be put back. A
-        // kept archive was never taken apart.
+        // kept archive was never taken apart, and a pack has nothing to
+        // put back; its folder went into the archive for good.
         self.view.can_give_back = !self.restoring
             && !self.is_test
+            && !self.packing
             && !self.keep
             && (self.view.phase == Phase::Paused
                 || (self.view.phase == Phase::Failed && self.resumable));
@@ -360,7 +441,9 @@ impl Task {
         v.fraction = (done as f64 / total as f64).min(1.0) as f32;
         v.amounts = format!("{} of {}", human(done), human(total)).into();
         v.rate = self.rate.describe(total.saturating_sub(done)).into();
-        if !self.is_test && !self.keep && v.phase != Phase::Verifying {
+        // A kept archive never shrinks, and a pack has no archive to
+        // shrink, so there is nothing to count down.
+        if !self.is_test && !self.keep && !self.packing && v.phase != Phase::Verifying {
             let left = counters.archive.load(Ordering::Relaxed);
             self.remaining_archive_bytes = Some(left);
             v.archive_left = format!("Archive remaining: {}", human(left)).into();
@@ -579,7 +662,11 @@ mod tests {
         let mut t = Task::extract("game.zip", Some(Path::new("/games")), false);
         let mut plan = space(1_000_000_000, 5_000_000_000, 2_000_000_000, 9_000_000_000);
         plan.solid_block_bound = true;
-        t.apply(Update::NoSpace(plan));
+        t.apply(Update::NoSpace {
+            needed: plan.needed,
+            avail: plan.free,
+            plan: Some(plan),
+        });
         assert_eq!(t.view.phase, Phase::NoSpace);
         assert!(t.view.can_retry);
         assert_eq!(
@@ -588,6 +675,74 @@ mod tests {
         );
         assert!(t.plan.note.contains("solid block"));
         assert!(!t.running());
+    }
+
+    #[test]
+    fn a_pack_runs_pauses_and_finishes_without_a_restore() {
+        let mut t = Task::pack("game", Some(Path::new("/games/game.7z")));
+        assert_eq!(t.view.phase, Phase::Checking);
+        assert_eq!(t.view.heading, "Packing game");
+        assert_eq!(t.view.detail, "Destination: /games/game.7z");
+        assert_eq!(t.output.as_deref(), Some(Path::new("/games")));
+        assert!(t.running());
+
+        t.apply(Update::Packing {
+            output: "/games/game.7z".into(),
+        });
+        assert_eq!(t.view.phase, Phase::Working);
+        let counters = Counters::default();
+        counters.total.store(4_000_000_000, Ordering::Relaxed);
+        counters.done.store(1_000_000_000, Ordering::Relaxed);
+        t.tick(Instant::now(), &counters);
+        assert_eq!(t.view.fraction, 0.25);
+        assert_eq!(t.view.archive_left, "", "a pack has no archive to shrink");
+
+        assert!(t.request_pause());
+        t.apply(Update::Paused);
+        assert_eq!(t.view.phase, Phase::Paused);
+        assert_eq!(t.view.heading, "Pack paused");
+        assert!(!t.view.can_give_back, "a pack has nothing to put back");
+
+        t.apply(Update::Packed {
+            target: "/games/game.7z".into(),
+            warning: Some("three files that appeared stayed".into()),
+        });
+        assert_eq!(t.view.phase, Phase::Done);
+        assert_eq!(t.view.heading, "Pack complete");
+        assert!(t.view.can_open_folder);
+        assert_eq!(t.output.as_deref(), Some(Path::new("/games")));
+        assert_eq!(
+            t.view.message,
+            "The folder was packed into /games/game.7z. three files that appeared stayed."
+        );
+
+        // A pack's refusal carries just the numbers, and offers a recheck.
+        let mut t = Task::pack("game", Some(Path::new("/games/game.7z")));
+        t.apply(Update::NoSpace {
+            plan: None,
+            needed: 5_000_000_000,
+            avail: 1_000_000_000,
+        });
+        assert_eq!(t.view.phase, Phase::NoSpace);
+        assert!(t.view.can_retry);
+        assert_eq!(
+            t.view.message,
+            "Insufficient disk space. 4.0 GB more is required."
+        );
+        assert_eq!(t.view.space, "Required: 5.0 GB. Available: 1.0 GB.");
+
+        let mut t = Task::pack("game", Some(Path::new("/games/game.7z")));
+        t.apply(Update::Failed(Failure {
+            message: "Disk full.".into(),
+            resumable: true,
+        }));
+        assert_eq!(t.view.heading, "Pack failed");
+        assert_eq!(
+            t.view.message,
+            "Disk full. Progress is saved; the pack can be resumed."
+        );
+        assert!(t.view.can_retry);
+        assert!(!t.view.can_give_back);
     }
 
     #[test]

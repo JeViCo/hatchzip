@@ -1,6 +1,7 @@
 //! The command line. File manager menus call these exact forms, so changing
 //! one breaks every installed right-click entry. Each task form takes one
-//! archive or several, which run one after another.
+//! archive or several, which run one after another; packing takes a single
+//! folder.
 
 use std::path::PathBuf;
 
@@ -17,6 +18,7 @@ use clap::{ArgGroup, Parser};
         "extract_to",
         "extract_files",
         "test",
+        "pack_here",
         "register_shell",
         "unregister_shell",
     ])),
@@ -37,6 +39,10 @@ pub struct Args {
     /// Check every file for damage, without writing anything
     #[arg(long, value_name = "ARCHIVE", num_args = 1..)]
     pub test: Option<Vec<PathBuf>>,
+    /// Pack the folder into an archive beside it, removing the folder
+    /// progressively
+    #[arg(long, value_name = "FOLDER", num_args = 1)]
+    pub pack_here: Option<PathBuf>,
     /// With an extract option: keep the archive, removing nothing
     #[arg(long, requires = "extracting")]
     pub keep_archive: bool,
@@ -55,6 +61,9 @@ pub enum TaskKind {
     /// Into a folder the person picks, which is asked for first when it is
     /// `None`.
     ExtractFiles(Option<PathBuf>),
+    /// Pack one folder into an archive beside it. The folder itself rides
+    /// in `archives`, like every other kind's paths.
+    PackHere,
     Test,
 }
 
@@ -100,6 +109,8 @@ impl Args {
             task(TaskKind::ExtractFiles(None), a)
         } else if let Some(a) = self.test {
             task(TaskKind::Test, a)
+        } else if let Some(a) = self.pack_here {
+            task(TaskKind::PackHere, vec![a])
         } else {
             Launch::Main(self.archive)
         }
@@ -155,6 +166,14 @@ mod tests {
             task(TaskKind::Test, &["game.tar"], false)
         );
         assert_eq!(
+            parse(&["--pack-here", "game"]).unwrap(),
+            task(TaskKind::PackHere, &["game"], false)
+        );
+        assert_eq!(
+            parse(&["--pack-here=game"]).unwrap(),
+            task(TaskKind::PackHere, &["game"], false)
+        );
+        assert_eq!(
             parse(&["--extract-here=game.zip"]).unwrap(),
             task(TaskKind::ExtractHere, &["game.zip"], false)
         );
@@ -184,6 +203,7 @@ mod tests {
         assert!(parse(&["--keep-archive"]).is_err());
         assert!(parse(&["--keep-archive", "--test", "a.zip"]).is_err());
         assert!(parse(&["--keep-archive", "a.zip"]).is_err());
+        assert!(parse(&["--keep-archive", "--pack-here", "a"]).is_err());
     }
 
     #[test]
@@ -203,5 +223,10 @@ mod tests {
         assert!(parse(&["a.zip", "--extract-here", "b.zip"]).is_err());
         assert!(parse(&["--extract-here"]).is_err());
         assert!(parse(&["a.zip", "b.zip"]).is_err());
+        // Packing takes exactly one folder.
+        assert!(parse(&["--pack-here"]).is_err());
+        assert!(parse(&["--pack-here", "a", "b"]).is_err());
+        assert!(parse(&["--pack-here", "a", "--test", "b.zip"]).is_err());
+        assert!(parse(&["a", "--pack-here", "b"]).is_err());
     }
 }

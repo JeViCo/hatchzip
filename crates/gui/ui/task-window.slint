@@ -25,6 +25,23 @@ export component TaskWindow inherits Window {
     public function replace-instructions(removing: bool) -> string { return removing ? @tr("Replace deletes the existing file when the extraction completes. Skip keeps it, and the archive's copy is not kept. Keep both keeps it and adds the archive's copy with a number after its name.") : @tr("Replace deletes the existing file when the extraction completes. Skip keeps it. Keep both keeps it and adds the archive's copy with a number after its name."); }
     public function replace-remaining(left: int, count: string) -> string { return left == 0 ? "" : @tr("Do the same for the next file" | "Do the same for the next {} files" % left, count); }
 
+    // The strings of a pack, translated like the main window translates
+    // its own; the Rust side calls these with the task's state.
+    public function pack-heading(phase: Phase, name: string) -> string {
+        if (phase == Phase.done) { return @tr("Pack complete"); }
+        if (phase == Phase.paused) { return @tr("Pack paused"); }
+        if (phase == Phase.failed) { return @tr("Pack failed"); }
+        if (phase == Phase.no-space) { return @tr("Insufficient disk space"); }
+        return @tr("Packing {}", name);
+    }
+    public function task-destination(path: string) -> string { return @tr("Destination: {}", path); }
+    public function pack-paused() -> string { return @tr("Progress is saved. The pack can be resumed now or later."); }
+    public function pack-resumable(reason: string) -> string { return @tr("{} Progress is saved; the pack can be resumed.", reason); }
+    public function packed-result(target: string, warning: string) -> string {
+        if (warning == "") { return @tr("The folder was packed into {}.", target); }
+        return @tr("The folder was packed into {}. {}", target, warning);
+    }
+
     callback replace-answer(int, bool);
     callback replace-cancel();
 
@@ -72,7 +89,7 @@ export component TaskWindow inherits Window {
         if root.task.phase == Phase.verifying || root.task.phase == Phase.working || root.task.phase == Phase.pausing || root.task.phase == Phase.paused: Progress {
             task: root.task;
         }
-        if root.task.phase == Phase.no-space: Text {
+        if root.task.phase == Phase.no-space && root.plan.ready: Text {
             text: "Available: " + root.plan.free + ". Required: " + root.plan.needed + ", plus " + root.plan.keep + " reserved.";
             color: Theme.muted;
             wrap: word-wrap;
