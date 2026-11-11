@@ -234,7 +234,7 @@ The same command resumes an interrupted pack: progress lives in `game.7z.hatchzi
 
 `--finish` ends a pack early on purpose: what is packed so far becomes a readable `game.7z`, and everything not yet packed stays in the folder, untouched. Nothing is lost either way, but the journal goes with it, so the pack cannot be resumed afterwards. If a source file changes or disappears while the pack runs, the error names `--finish` as the way out.
 
-Refused before anything is packed: links (a link would be followed, a file with several names would be counted twice and freed once), names a backslash in, and a single file larger than the space free beside it, since a file is deleted only once its whole compressed block is written. `--keep-free` and `-y` work as for extraction, and exit code 3 means there was not enough space.
+A single file bigger than everything else is streamed: its compressed copy grows in the archive while its own bytes are punched out of the source file behind the compressor, so even a file far larger than the free space packs fine (on filesystems that can free bytes inside a file; FAT32 and exFAT cannot, and there the old refusal stands, naming the file). The compression restarts from checkpoints, so a crash or a pause mid-file loses at most one checkpoint's worth of work. `--keep-free` and `-y` work as for extraction, and exit code 3 means there was not enough space.
 
 ### Several archives
 

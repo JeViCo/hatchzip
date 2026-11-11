@@ -599,3 +599,118 @@ fn finishing_early_with_nothing_packed_cancels_cleanly() {
     let text = String::from_utf8_lossy(&refused.stderr);
     assert!(text.contains("no pack in progress"), "{text}");
 }
+
+/// A single file far bigger than the disk can hold beside itself is
+/// streamed with punching: the source frees its own bytes behind the
+/// compressor, the resume points carry it across a crash, and the packed
+/// archive is byte for byte what a plain pack would have made.
+#[test]
+fn a_huge_file_streams_with_punching_and_resumes() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mut files = Files::new();
+    files.insert("game/data/huge.bin".into(), common::noise(12_000_000, 5));
+    files.insert("game/other.txt".into(), b"other\n".to_vec());
+    let source = make_tree(tmp.path(), &files);
+    let target = tmp.path().join("game.7z");
+
+    let crashed = hatchzip(
+        &[
+            "pack",
+            source.to_str().unwrap(),
+            "--keep-free",
+            "0",
+            "--yes",
+        ],
+        &[
+            ("HATCHZIP_FREE", "4000000"),
+            ("HATCHZIP_PACK_BATCH", "1000000"),
+            ("HATCHZIP_PACK_STEP", "1000000"),
+            ("HATCHZIP_CRASH_AT", "after-stream-point"),
+            ("HATCHZIP_CRASH_AFTER", "2"),
+        ],
+    );
+    assert!(!crashed.status.success());
+    assert!(
+        target.is_file(),
+        "the archive should exist; stderr: {}",
+        String::from_utf8_lossy(&crashed.stderr)
+    );
+    assert!(
+        source.join("game/data/huge.bin").is_file(),
+        "mid-stream the file is still there, part holes"
+    );
+
+    assert_ok(&pack(&source, &[]));
+    assert_packed(tmp.path(), &source, &files);
+}
+
+/// Finishing early while a file streams completes that file: it is fully
+/// in the archive and gone from the folder, and the rest stays.
+#[test]
+fn finishes_early_completes_a_streaming_file() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mut files = Files::new();
+    files.insert("game/data/huge.bin".into(), common::noise(12_000_000, 6));
+    files.insert("game/other.txt".into(), b"other\n".to_vec());
+    let source = make_tree(tmp.path(), &files);
+    let target = tmp.path().join("game.7z");
+
+    let crashed = hatchzip(
+        &[
+            "pack",
+            source.to_str().unwrap(),
+            "--keep-free",
+            "0",
+            "--yes",
+        ],
+        &[
+            ("HATCHZIP_FREE", "4000000"),
+            ("HATCHZIP_PACK_BATCH", "1000000"),
+            ("HATCHZIP_PACK_STEP", "1000000"),
+            ("HATCHZIP_CRASH_AT", "after-stream-point"),
+            ("HATCHZIP_CRASH_AFTER", "1"),
+        ],
+    );
+    assert!(!crashed.status.success());
+
+    let finished = hatchzip(
+        &[
+            "pack",
+            source.to_str().unwrap(),
+            "--finish",
+            "--keep-free",
+            "0",
+            "--yes",
+        ],
+        &[],
+    );
+    assert!(
+        finished.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&finished.stderr)
+    );
+    let text = String::from_utf8_lossy(&finished.stdout);
+    assert!(
+        text.contains("Kept the 1 of 2 files packed so far"),
+        "{text}"
+    );
+    for p in pack_side_files(&target) {
+        assert!(!p.exists(), "{} should be cleaned up", p.display());
+    }
+
+    // The streamed file went fully into the archive and was deleted; the
+    // file that was never started stayed.
+    assert!(!source.join("game/data/huge.bin").is_file());
+    assert_eq!(
+        fs::read(source.join("game/other.txt")).unwrap(),
+        files["game/other.txt"]
+    );
+
+    let out = tmp.path().join("out");
+    assert_ok(&common::extract(&target, &out, &[]));
+    assert_eq!(
+        fs::read(out.join("game/data/huge.bin")).unwrap(),
+        files["game/data/huge.bin"]
+    );
+    assert!(!out.join("game/other.txt").exists());
+}

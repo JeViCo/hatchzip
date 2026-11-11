@@ -393,6 +393,126 @@ pub fn encode_row(b: &Block) -> [u8; ROW] {
     row
 }
 
+/// Compresses one segment of a streamed file: its own LZMA2 run, starting
+/// with a dictionary and state reset, which is legal at any point of an
+/// LZMA2 stream. The trailing end marker goes unless this is the last
+/// segment, so the pieces a packed stream is built from read as one.
+/// Returns the compressed bytes, the bytes consumed, and their CRC.
+pub fn compress_segment(
+    read: impl Read,
+    dict: u32,
+    first: bool,
+    last: bool,
+) -> Result<(Vec<u8>, u64, u32)> {
+    let mut src = Measured::new(read);
+    let mut encoder = Lzma2Writer::new(Vec::new(), options(dict));
+    copy(&mut src, &mut encoder)?;
+    let mut out = encoder
+        .finish()
+        .map_err(|e| anyhow!("finishing a compressed segment: {e}"))?;
+    if !last {
+        let end = out
+            .pop()
+            .expect("the LZMA2 end marker is at least one byte");
+        assert_eq!(end, 0, "the LZMA2 end marker is one zero byte");
+    }
+    let _ = first;
+    Ok((out, src.size, src.crc.finalize()))
+}
+
+/// Joins two CRC-32 values of consecutive byte ranges into the CRC of the
+/// whole, the way zlib does since 1.3: crc1 shifted forward by len2 bytes
+/// (x^(len2 * 8) mod p, applied by multmodp), crc2 XORed on. What a
+/// streamed file's journal carries across a restart.
+pub fn crc32_combine(crc1: u32, crc2: u32, len2: u64) -> u32 {
+    if len2 == 0 {
+        return crc1;
+    }
+    crc32_combine_op(crc1, crc2, crc32_shift_op(len2))
+}
+
+/// The operator crc32_combine builds for a length: x^(len2 * 8) mod p.
+fn crc32_shift_op(len2: u64) -> u32 {
+    // x2n_table[k] = x^(2^(k+1)) mod p, k counted from the low bits of n.
+    fn multmodp(a: u32, mut b: u32) -> u32 {
+        let mut m = 1u32 << 31;
+        let mut p = 0u32;
+        loop {
+            if a & m != 0 {
+                p ^= b;
+                if a & (m - 1) == 0 {
+                    break;
+                }
+            }
+            m >>= 1;
+            b = if b & 1 != 0 {
+                (b >> 1) ^ 0xedb8_8320
+            } else {
+                b >> 1
+            };
+        }
+        p
+    }
+
+    let mut table = [0u32; 32];
+    let mut square = 1u32 << 30;
+    for slot in table.iter_mut() {
+        *slot = square;
+        square = multmodp(square, square);
+    }
+    #[cfg(test)]
+    if len2 == 700_001 {
+        eprintln!("rust table head: {:x?}", &table[..6]);
+        eprintln!(
+            "rust mm tests: {:x} {:x} {:x}",
+            multmodp(0xC000_0000, 0x1234_5678),
+            multmodp(0x55dc_1152, 0x74be_b8ea),
+            multmodp(0xbc3b_33ac, 0x74be_b8ea)
+        );
+    }
+
+    let mut q = 1u32 << 31;
+    // k starts at 3: the table holds powers of x^2, and len2 counts bytes,
+    // which are x^8, so the bits of len2 are worth x^(8 * 2^k) each.
+    let mut k = 3usize;
+    let mut len2 = len2;
+    while len2 != 0 {
+        if len2 & 1 != 0 {
+            q = multmodp(table[k & 31], q);
+        }
+        len2 >>= 1;
+        k += 1;
+    }
+    q
+}
+
+/// zlib's crc32_combine_op: multmodp(op, crc1) ^ crc2.
+fn crc32_combine_op(crc1: u32, crc2: u32, op: u32) -> u32 {
+    if op == 0 {
+        return 0;
+    }
+    fn multmodp(a: u32, mut b: u32) -> u32 {
+        let mut m = 1u32 << 31;
+        let mut p = 0u32;
+        loop {
+            if a & m != 0 {
+                p ^= b;
+                if a & (m - 1) == 0 {
+                    break;
+                }
+            }
+            m >>= 1;
+            b = if b & 1 != 0 {
+                (b >> 1) ^ 0xedb8_8320
+            } else {
+                b >> 1
+            };
+        }
+        p
+    }
+    multmodp(op, crc1) ^ crc2
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -505,6 +625,96 @@ mod tests {
             assert_eq!(from_props, dict, "props {p} for dictionary {dict}");
             dict <<= 1;
         }
+    }
+
+    /// Segments concatenate into one LZMA2 stream: a decoder reads the
+    /// pieces stripped of their end markers, then the last piece whole,
+    /// and sees exactly the bytes fed.
+    #[test]
+    fn segments_read_as_one_stream() {
+        let data = common_noise(3_000_000);
+        let step = 1 << 20;
+        let mut stream: Vec<u8> = Vec::new();
+        let mut at = 0;
+        while at < data.len() {
+            let last = at + step >= data.len();
+            let (piece, fed, crc) = compress_segment(
+                &data[at..(at + step).min(data.len())],
+                1 << 20,
+                at == 0,
+                last,
+            )
+            .unwrap();
+            assert_eq!(fed, u64::try_from(step.min(data.len() - at)).unwrap());
+            let _ = crc;
+            stream.extend_from_slice(&piece);
+            at += step;
+        }
+
+        let mut decoded = Vec::new();
+        let mut reader = lzma_rust2::Lzma2Reader::new(&stream[..], 1 << 20, None);
+        reader.read_to_end(&mut decoded).unwrap();
+        assert_eq!(decoded, data);
+    }
+
+    /// The combine is the CRC of the concatenation, at any split.
+    #[test]
+    fn crcs_combine_like_concatenation() {
+        let a = common_noise(700_001);
+        let b = common_noise(1_000_000);
+        // A split inside a: the pieces join back to exactly a.
+        for split in [0usize, 1, 12345, a.len()] {
+            let joined = crc32_combine(
+                crc32fast::hash(&a[..split]),
+                crc32fast::hash(&a[split..]),
+                (a.len() - split) as u64,
+            );
+            eprintln!(
+                "split {split}: joined {:08x} crc1 {:08x} crc2 {:08x} len2 {} shift {:08x} whole {:08x}",
+                joined,
+                crc32fast::hash(&a[..split]),
+                crc32fast::hash(&a[split..]),
+                a.len() - split,
+                crc32_shift_op((a.len() - split) as u64),
+                crc32fast::hash(&a)
+            );
+            assert_eq!(joined, crc32fast::hash(&a), "split at {split}");
+        }
+        // The whole of a and the whole of b join to a followed by b.
+        let mut whole = a.clone();
+        whole.extend_from_slice(&b);
+        let joined = crc32_combine(crc32fast::hash(&a), crc32fast::hash(&b), b.len() as u64);
+        assert_eq!(joined, crc32fast::hash(&whole));
+        assert_eq!(
+            crc32_combine(crc32fast::hash(&a), 0, 0),
+            crc32fast::hash(&a)
+        );
+        // Reference values from the same arithmetic in zlib's multmodp and
+        // x2nmodp, run against this data in isolation.
+        assert_eq!(crc32_shift_op(700_001), 0x55dc_1152);
+        assert_eq!(
+            crc32_combine(
+                crc32fast::hash(&a[..1]),
+                crc32fast::hash(&a[1..]),
+                (a.len() - 1) as u64
+            ),
+            crc32fast::hash(&a)
+        );
+        eprintln!("shift op: {:x}", crc32_shift_op(700_001));
+        eprintln!("crc a: {:x}", crc32fast::hash(&a));
+    }
+
+    /// Deterministic bytes for the tests above.
+    fn common_noise(len: usize) -> Vec<u8> {
+        let mut x = 0x1234_5678u32;
+        (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                x as u8
+            })
+            .collect()
     }
 
     /// Numbers round trip through the encoding 7z defines.

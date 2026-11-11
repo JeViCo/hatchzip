@@ -10,7 +10,7 @@
 //! per packed block.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -44,6 +44,16 @@ const MAX_TOTAL: u64 = 1 << 62;
 
 fn batch_bytes() -> u64 {
     knob("HATCHZIP_PACK_BATCH").unwrap_or(BATCH_BYTES)
+}
+
+/// A streamed file is compressed in independent chunks of about this many
+/// source bytes, and the source is punched behind each one. Each chunk
+/// boundary is a resume point, so this is also the most a punched pack
+/// holds twice while it runs.
+const STREAM_STEP: u64 = 256 * 1024 * 1024;
+
+fn stream_step() -> u64 {
+    knob("HATCHZIP_PACK_STEP").unwrap_or(STREAM_STEP)
 }
 
 /// A setting only the test suite uses. Release builds ignore it.
@@ -128,6 +138,26 @@ struct Journal {
     /// The end header is written and the archive is whole: only the
     /// cleanup is left.
     finished: bool,
+    /// A file being streamed with punching, mid-flight. Its source prefix
+    /// is already holes, so finishing that file on a resume is the only
+    /// way forward: see [`StreamPoint`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stream: Option<StreamPoint>,
+}
+
+/// Where a streamed file stands: the source bytes before `source_pos` are
+/// holes now, their compressed copy ends at `archive_len` in the archive
+/// (flushed, and the journal was saved before the holes were punched), and
+/// `crc` covers those source bytes while `comp_crc` covers the compressed
+/// bytes. Both positions sit where a chunk ends, which is where compression
+/// can restart with a fresh encoder.
+#[derive(Serialize, Deserialize, Clone)]
+struct StreamPoint {
+    name: String,
+    source_pos: u64,
+    archive_len: u64,
+    crc: u32,
+    comp_crc: u32,
 }
 
 /// The files a pack keeps beside the archive it is building.
@@ -288,13 +318,20 @@ pub struct SpacePlan {
 pub fn space_plan(source: &Path, target: &Path, keep_free: u64) -> Result<SpacePlan> {
     let rows = walk(source)?;
     let bytes: u64 = rows.iter().filter(|r| !r.is_dir).map(|r| r.size).sum();
+    let punch = fsutil::can_punch(source);
     let largest = rows
         .iter()
-        .filter(|r| !r.is_dir)
-        .map(|r| r.size)
+        .filter(|r| !r.is_dir && r.size > 0)
+        .map(|r| {
+            if punch && r.size > batch_bytes() {
+                stream_step() + expansion(stream_step())
+            } else {
+                expansion(r.size)
+            }
+        })
         .max()
         .unwrap_or(0);
-    let needs = expansion(largest)
+    let needs = largest
         + header_room(&rows)
         + list_bytes(&rows)
         + rows.len() as u64 * sevenz::ROW as u64
@@ -425,17 +462,25 @@ fn fresh(
     let rows = walk(source)?;
     let blocks = rows.iter().filter(|r| !r.is_dir && r.size > 0).count() as u64;
     let bytes: u64 = rows.iter().filter(|r| !r.is_dir).map(|r| r.size).sum();
+    // A file bigger than a batch is streamed with punching when the source
+    // filesystem frees bytes inside files, so it costs about one chunk of
+    // headroom instead of its whole size. Without punching it holds its
+    // size twice until it is done, like every file.
+    let punch = fsutil::can_punch(source);
     let largest = rows
         .iter()
-        .filter(|r| !r.is_dir)
-        .map(|r| r.size)
+        .filter(|r| !r.is_dir && r.size > 0)
+        .map(|r| {
+            if punch && r.size > batch_bytes() {
+                stream_step() + expansion(stream_step())
+            } else {
+                expansion(r.size)
+            }
+        })
         .max()
         .unwrap_or(0);
-    let needs = expansion(largest)
-        + header_room(&rows)
-        + list_bytes(&rows)
-        + blocks * sevenz::ROW as u64
-        + SLICE_ROOM;
+    let needs =
+        largest + header_room(&rows) + list_bytes(&rows) + blocks * sevenz::ROW as u64 + SLICE_ROOM;
     let usable = usable_space(target, keep_free)?;
     if needs > usable {
         let file = rows
@@ -483,11 +528,13 @@ fn fresh(
         list_crc: crc32fast::hash(&list),
         list_len: list.len() as u64,
         finished: false,
+        stream: None,
     };
     save(paths, &journal)?;
 
     chosen::remember(target, source);
     let data = data_rows(&rows);
+    let punch = fsutil::can_punch(source);
     run(
         Session {
             rows,
@@ -497,6 +544,7 @@ fn fresh(
             journal,
             archive,
             index,
+            punch,
             keep_free,
             stop,
             progress,
@@ -561,6 +609,7 @@ fn resume(
         .sum();
 
     let data = data_rows(&rows);
+    let punch = fsutil::can_punch(source);
     run(
         Session {
             rows,
@@ -573,6 +622,7 @@ fn resume(
             },
             archive,
             index,
+            punch,
             keep_free,
             stop,
             progress,
@@ -598,14 +648,21 @@ fn open_pack(paths: &Paths, source: &Path) -> Result<(Journal, Vec<Row>, Vec<Blo
     let blocks = read_index(paths, &journal, &rows)?;
 
     let archive = open_locked(&paths.target)?;
+    // Mid-stream, the durable point of the file being streamed is what the
+    // archive is cut back to, not the last committed block.
+    let rest = journal
+        .stream
+        .as_ref()
+        .map(|p| p.archive_len)
+        .unwrap_or(journal.committed_len);
     let len = archive.metadata()?.len();
-    if len < journal.committed_len {
+    if len < rest {
         bail!(
             "'{}' is shorter than its journal says. Nothing can be told about it",
             fsutil::plain(&paths.target).display()
         );
     }
-    archive.set_len(journal.committed_len)?;
+    archive.set_len(rest)?;
     Ok((journal, rows, blocks, archive))
 }
 
@@ -627,6 +684,9 @@ struct Session<'a> {
     journal: Journal,
     archive: File,
     index: File,
+    /// Whether the source filesystem can free bytes inside a file, which
+    /// is what a streamed file's punching needs. Probed once.
+    punch: bool,
     keep_free: u64,
     stop: &'a AtomicBool,
     progress: Progress,
@@ -649,13 +709,46 @@ fn run(mut s: Session, mut blocks: Vec<Block>) -> Result<Outcome> {
         Err(e) if e.is::<Paused>() => Ok(Outcome::Paused),
         Err(e) => Err(e),
     };
-    // Whatever happened, the archive ends where the journal says a
-    // committed block ends, so the next run starts from solid ground.
-    let _ = s.archive.set_len(s.journal.committed_len);
+    // Whatever happened, the archive ends at a length the journal vouches
+    // for: a committed block, or, mid-stream, the last durable point.
+    let rest = s
+        .journal
+        .stream
+        .as_ref()
+        .map(|p| p.archive_len)
+        .unwrap_or(s.journal.committed_len);
+    let _ = s.archive.set_len(rest);
     outcome
 }
 
 fn run_batches(s: &mut Session, blocks: &mut Vec<Block>) -> Result<()> {
+    // A streamed file left halfway is finished first: its source is partly
+    // holes, so going forward is the only direction it has.
+    while let Some(point) = s.journal.stream.clone() {
+        // The streamed file is the next uncommitted one, in the manifest's
+        // order: anything else would put its block where another file's
+        // belongs.
+        let index = s
+            .data
+            .get(s.journal.blocks_done as usize)
+            .copied()
+            .with_context(|| {
+                format!(
+                    "'{}' is being streamed but every file is already packed",
+                    point.name
+                )
+            })?;
+        if s.rows[index].name != point.name {
+            bail!(
+                "'{}' is being streamed, but the next file to pack is '{}'; the pack \
+                 journal is damaged",
+                point.name,
+                s.rows[index].name
+            );
+        }
+        let block = stream_file(s, index, Some(point))?;
+        blocks.push(block);
+    }
     let mut done = s.journal.blocks_done as usize;
     while done < s.data.len() {
         if s.stop.load(Ordering::Relaxed) {
@@ -663,6 +756,14 @@ fn run_batches(s: &mut Session, blocks: &mut Vec<Block>) -> Result<()> {
         }
         let batch = choose_batch(s, done)?;
         let solo = batch.len() == 1 && s.rows[batch[0]].size > batch_bytes();
+        if solo && s.punch {
+            // The file is streamed with punching, so it does not need its
+            // size free beside itself, whatever its size.
+            let block = stream_file(s, batch[0], None)?;
+            blocks.push(block);
+            done += batch.len();
+            continue;
+        }
         let more = one_batch(s, &batch, solo)?;
         blocks.extend(more);
         done += batch.len();
@@ -683,10 +784,16 @@ fn choose_batch(s: &Session, done: usize) -> Result<Vec<usize>> {
     let mut sum = 0u64;
     for &i in &s.data[done..] {
         let size = s.rows[i].size;
-        if batch.is_empty() && expansion(size) > disk {
+        // A punched stream only needs its next chunk of headroom.
+        let need = if s.punch && size > batch_bytes() {
+            expansion(stream_step())
+        } else {
+            expansion(size)
+        };
+        if batch.is_empty() && need > disk {
             return Err(anyhow::Error::new(NoSpace {
                 file: s.row_path(&s.rows[i].name),
-                needed: expansion(size),
+                needed: need,
                 avail: usable,
             })
             .context(
@@ -712,7 +819,7 @@ fn one_batch(s: &mut Session, batch: &[usize], solo: bool) -> Result<Vec<Block>>
     if solo {
         let row = s.rows[batch[0]].clone();
         let path = s.row_path(&row.name);
-        check_still(&row, &path)?;
+        check_still(&row, &path, false)?;
         let src = File::open(&path).with_context(|| {
             format!(
                 "reading {}. If it is gone for good, keep what is packed so far with \
@@ -723,7 +830,7 @@ fn one_batch(s: &mut Session, batch: &[usize], solo: bool) -> Result<Vec<Block>>
         s.archive.seek(SeekFrom::Start(start_len))?;
         let block = sevenz::stream(src, &mut s.archive, sevenz::dictionary_for(row.size))
             .with_context(|| format!("packing {}", fsutil::plain(&path).display()))?;
-        check_still(&row, &path)?;
+        check_still(&row, &path, false)?;
         appended.push(block);
     } else {
         let packed: Vec<(usize, Block, Vec<u8>)> = batch
@@ -744,7 +851,7 @@ fn one_batch(s: &mut Session, batch: &[usize], solo: bool) -> Result<Vec<Block>>
             })
             .collect::<Result<_>>()?;
         for (i, _, _) in &packed {
-            check_still(&s.rows[*i], &s.row_path(&s.rows[*i].name))?;
+            check_still(&s.rows[*i], &s.row_path(&s.rows[*i].name), false)?;
         }
         s.archive.seek(SeekFrom::Start(start_len))?;
         for (_, _, bytes) in &packed {
@@ -798,12 +905,179 @@ fn one_batch(s: &mut Session, batch: &[usize], solo: bool) -> Result<Vec<Block>>
     Ok(appended)
 }
 
+/// Streams one file straight into the archive, punching holes in its
+/// source behind the compressor, or finishes what a previous run left
+/// halfway. Either way the file ends fully packed and committed, and its
+/// source is gone: that is the price of the freed space.
+///
+/// The file is compressed in independent segments of `stream_step()` source
+/// bytes, each with its own dictionary reset, so any segment boundary is a
+/// point where compression can restart with a fresh encoder and a decoder
+/// still reads the whole stream from its beginning. At each boundary the
+/// archive is flushed and the point is journalled, and only then is the
+/// source punched: the holes never run past the durable point.
+fn stream_file(s: &mut Session, index: usize, resume: Option<StreamPoint>) -> Result<Block> {
+    let row = s.rows[index].clone();
+    let path = s.row_path(&row.name);
+    let block_start = s.journal.committed_len;
+    let (mut source_pos, mut arc_len, mut crc, mut comp_crc, mut comp_len, mut punched) =
+        match &resume {
+            Some(p) => {
+                check_still(&row, &path, true)?;
+                // The compressed bytes before the point are already in the
+                // archive, and their crc is journaled: both totals start
+                // from the point, not from zero.
+                (
+                    p.source_pos,
+                    p.archive_len,
+                    p.crc,
+                    p.comp_crc,
+                    p.archive_len - block_start,
+                    p.source_pos,
+                )
+            }
+            None => {
+                check_still(&row, &path, false)?;
+                (0, block_start, 0, 0, 0, 0)
+            }
+        };
+    let dict = sevenz::dictionary_for(row.size);
+    let step = stream_step();
+
+    s.archive.seek(SeekFrom::Start(arc_len))?;
+    let mut src = platform::open_existing_no_follow(&path).with_context(|| {
+        format!(
+            "reading {}. If it is gone for good, keep what is packed so far with \
+             `hatchzip pack <folder> --finish`",
+            fsutil::plain(&path).display()
+        )
+    })?;
+    src.seek(SeekFrom::Start(source_pos))?;
+
+    loop {
+        if s.stop.load(Ordering::Relaxed) {
+            return Err(anyhow::Error::new(Paused));
+        }
+        let last = source_pos + step >= row.size;
+        let mut piece = Vec::new();
+        Read::by_ref(&mut src)
+            .take(step)
+            .read_to_end(&mut piece)
+            .with_context(|| {
+                format!(
+                    "reading {}. If it is gone for good, keep what is packed so far with \
+                     `hatchzip pack <folder> --finish`",
+                    fsutil::plain(&path).display()
+                )
+            })?;
+        let fed = piece.len() as u64;
+
+        let (compressed, _out_len, seg_crc) =
+            sevenz::compress_segment(&piece[..], dict, source_pos == 0, last)
+                .with_context(|| format!("packing {}", fsutil::plain(&path).display()))?;
+        crc = sevenz::crc32_combine(crc, piece_crc_of(&piece), fed);
+        comp_crc = sevenz::crc32_combine(comp_crc, seg_crc, compressed.len() as u64);
+        comp_len += compressed.len() as u64;
+        s.archive
+            .write_all(&compressed)
+            .with_context(|| format!("writing {}", fsutil::plain(&s.paths.target).display()))?;
+        arc_len += compressed.len() as u64;
+        source_pos += fed;
+
+        let journal = Journal {
+            stream: Some(StreamPoint {
+                name: row.name.clone(),
+                source_pos,
+                archive_len: arc_len,
+                crc,
+                comp_crc,
+            }),
+            ..s.journal.clone()
+        };
+        s.archive
+            .sync_all()
+            .with_context(|| format!("flushing {}", fsutil::plain(&s.paths.target).display()))?;
+        save(&s.paths, &journal)?;
+        s.journal = journal;
+        engine::crash_point("after-stream-point");
+
+        if s.punch && punched < source_pos {
+            let freed = platform::punch_hole(&src, punched, source_pos - punched)
+                .with_context(|| format!("freeing space in {}", fsutil::plain(&path).display()))?;
+            if !freed {
+                bail!(
+                    "'{}' cannot be punched for space on this filesystem, and the pack \
+                     counted on it. Free the space and run the same command to go on",
+                    fsutil::plain(&path).display()
+                );
+            }
+            punched = source_pos;
+        }
+
+        if last {
+            break;
+        }
+    }
+
+    // Commit: the whole file is in the archive, one block of its own.
+    s.archive
+        .sync_all()
+        .with_context(|| format!("flushing {}", fsutil::plain(&s.paths.target).display()))?;
+    engine::crash_point("after-append");
+
+    let block = Block {
+        compressed_size: comp_len,
+        compressed_crc: comp_crc,
+        size: row.size,
+        crc,
+        dict,
+    };
+    s.index
+        .write_all(&sevenz::encode_row(&block))
+        .with_context(|| format!("writing {}", fsutil::plain(&s.paths.index).display()))?;
+    s.index
+        .sync_data()
+        .with_context(|| format!("flushing {}", fsutil::plain(&s.paths.index).display()))?;
+
+    let journal = Journal {
+        blocks_done: s.journal.blocks_done + 1,
+        committed_len: arc_len,
+        bytes_done: s.journal.bytes_done + row.size,
+        stream: None,
+        ..s.journal.clone()
+    };
+    save(&s.paths, &journal)?;
+    s.journal = journal;
+    engine::crash_point("after-journal");
+
+    match fs::remove_file(&path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            return Err(e).with_context(|| {
+                format!(
+                    "deleting {}. The archive is fine; run the same command to go on",
+                    fsutil::plain(&path).display()
+                )
+            });
+        }
+        _ => {}
+    }
+    (s.progress.on_bytes)(s.journal.bytes_done);
+    Ok(block)
+}
+
+/// The CRC of a piece of data, for the streamed file's running totals.
+fn piece_crc_of(data: &[u8]) -> u32 {
+    crc32fast::hash(data)
+}
+
 /// A file must not change between reading it and deleting it, or the pack
-/// would throw away what was never packed.
-fn check_still(row: &Row, path: &Path) -> Result<()> {
+/// would throw away what was never packed. A punched file's holes make the
+/// system touch its time, so only its size is checked there.
+fn check_still(row: &Row, path: &Path, punched: bool) -> Result<()> {
     let meta = fs::symlink_metadata(path)
         .with_context(|| format!("reading {}", fsutil::plain(path).display()))?;
-    if meta.len() != row.size || meta.modified().ok().and_then(filetime) != row.mtime {
+    if meta.len() != row.size || (!punched && meta.modified().ok().and_then(filetime) != row.mtime)
+    {
         bail!(
             "'{}' changed while it was being packed. Nothing was deleted; pack it again \
              once it is still, or keep what is packed so far with \
@@ -897,7 +1171,7 @@ pub fn finish(source: &Path, target: Option<&Path>) -> Result<Finished> {
             fsutil::plain(&target).display()
         );
     }
-    let (mut journal, rows, blocks, mut archive) = open_pack(&paths, &source)?;
+    let (journal, rows, blocks, archive) = open_pack(&paths, &source)?;
     if journal.finished {
         bail!(
             "'{}' is already whole. Run `hatchzip pack` on '{}' without --finish to delete \
@@ -907,12 +1181,60 @@ pub fn finish(source: &Path, target: Option<&Path>) -> Result<Finished> {
         );
     }
     let data = data_rows(&rows);
+
+    // A file being streamed is finished first: its source is partly holes,
+    // so it can only go forward, and forward is into the archive anyway.
+    // Then it counts as packed, and its source is deleted with the rest.
+    let mut blocks = blocks;
+    static NEVER: AtomicBool = AtomicBool::new(false);
+    let mut session = Session {
+        rows,
+        data,
+        source,
+        paths: paths.clone(),
+        journal,
+        archive,
+        index: OpenOptions::new()
+            .append(true)
+            .open(&paths.index)
+            .with_context(|| format!("opening {}", fsutil::plain(&paths.index).display()))?,
+        punch: false,
+        keep_free: 0,
+        stop: &NEVER,
+        progress: Progress {
+            on_bytes: Box::new(|_| {}),
+            on_commit: Box::new(|_| {}),
+        },
+    };
+    if let Some(point) = session.journal.stream.clone() {
+        let row_at = session
+            .data
+            .get(session.journal.blocks_done as usize)
+            .copied()
+            .with_context(|| {
+                format!(
+                    "'{}' is being streamed but every file is already packed",
+                    point.name
+                )
+            })?;
+        if session.rows[row_at].name != point.name {
+            bail!(
+                "'{}' is being streamed, but the next file to pack is '{}'; the pack \
+                 journal is damaged",
+                point.name,
+                session.rows[row_at].name
+            );
+        }
+        let block = stream_file(&mut session, row_at, Some(point))?;
+        blocks.push(block);
+    }
     let packed = blocks.len() as u64;
 
     // Nothing is packed yet, so the half-made archive holds nothing and
     // the folder is untouched: finishing here only means cancelling.
     if packed == 0 {
-        drop(archive);
+        let total = session.data.len() as u64;
+        drop(session);
         fs::remove_file(&paths.target)
             .with_context(|| format!("removing {}", fsutil::plain(&paths.target).display()))?;
         let _ = fs::remove_file(&paths.index);
@@ -923,23 +1245,26 @@ pub fn finish(source: &Path, target: Option<&Path>) -> Result<Finished> {
         return Ok(Finished {
             target,
             packed: 0,
-            total: data.len() as u64,
+            total,
             bytes: 0,
         });
     }
 
-    let entries: Vec<Entry> = rows
+    let entries: Vec<Entry> = session
+        .rows
         .iter()
         .filter(|r| !r.is_dir && r.size > 0)
         .take(blocks.len())
         .map(row_entry)
         .collect();
-    let end = write_header(&mut archive, &paths.target, &entries, &blocks)?;
+    let end = write_header(&mut session.archive, &paths.target, &entries, &blocks)?;
 
-    journal.finished = true;
-    journal.committed_len = end;
-    save(&paths, &journal)?;
-    drop(archive);
+    session.journal.finished = true;
+    session.journal.committed_len = end;
+    let bytes = session.journal.bytes_done;
+    let total = session.data.len() as u64;
+    save(&paths, &session.journal)?;
+    drop(session);
 
     // The folder stays: whatever was not packed is still in it, and the
     // archive is opened over it like any other 7z.
@@ -951,8 +1276,8 @@ pub fn finish(source: &Path, target: Option<&Path>) -> Result<Finished> {
     Ok(Finished {
         target,
         packed,
-        total: data.len() as u64,
-        bytes: journal.bytes_done,
+        total,
+        bytes,
     })
 }
 

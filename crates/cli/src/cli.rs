@@ -162,8 +162,8 @@ pub enum Command {
             compressed on its own (as 7-Zip's -ms=off writes).\n\n\
             Files that are links, and a folder holding files with more than one name on the \
             disk, are refused before anything is packed. A single file larger than the space \
-            free beside it is refused too, since it can only be deleted once its whole block \
-            is written."
+            free beside it is streamed with punching, where the filesystem allows it; \
+            elsewhere it is refused, naming the file."
     )]
     Pack {
         /// The folder to pack
