@@ -1,6 +1,6 @@
 # How it works
 
-This document describes how HatchZip extracts an archive while giving its space back, and why each step happens in the order it does. Read it before changing anything in `engine.rs`, `journal.rs` or `archive/storage.rs` under `crates/core/src`.
+This document describes how HatchZip extracts an archive while giving its space back, and how it packs a folder while doing the same in reverse, and why each step happens in the order it does. Read it before changing anything in `engine.rs`, `journal.rs`, `archive/storage.rs` or `pack.rs` under `crates/core/src`.
 
 ## The space problem
 
@@ -258,6 +258,46 @@ The steps, in order:
 9. Delete the journal, then the saved tail.
 
 Any run that opens an archive whose journal has `restoring` set, `restore` and `extract` alike, first cuts the archive back to `committed_len`, including a volume the new index made longer than it was, and puts back the bytes the field holds. So an interrupted restore can be run again, or the extraction continued instead. The journal goes before the tail because a journal without its tail can't be loaded; a tail left behind by a crash between the two is never read again. The test suite kills restore after steps 5 and 6 for every format and checks both ways on (`crates/cli/tests/restore.rs`).
+
+## Packing
+
+`hatchzip pack game` is the same idea run backwards (`crates/core/src/pack.rs`). It writes `game.7z` beside the folder and empties the folder into it: each file is compressed on its own, one LZMA2 block per file as 7-Zip's `-ms=off` writes, and deleted the moment its compressed copy is durable. The disk never holds much more than whichever of the folder and the archive is larger, and the finished archive is a normal 7z that 7-Zip and HatchZip read, with every file's modified time kept (7-Zip 24.09 passes one built this way; `crates/cli/tests/pack.rs` extracts its own output back with HatchZip and compares byte for byte, times included).
+
+The unit of work is one file, and units are packed front to back in the folder's sorted walk order, since the archive only grows. Files smaller than 128 MiB are compressed a batch at a time on parallel threads, each block in memory, and appended in order; a larger one is packed alone, streamed straight into the archive so its block never sits in memory. Before a batch's bytes are appended, every file in it is checked to be the size and time the walk saw, so a file changed under the pack stops it with nothing deleted rather than packing one version and deleting another.
+
+Each batch goes through the mirror of the extraction steps:
+
+1. **Compress** the batch, and check the files are still what the walk saw.
+2. **Append** the blocks to the archive and flush it, then flush the index rows.
+3. **Commit.** The journal records the new archive length and the number of files packed.
+4. **Delete** the batch's files. Their space is free for the next batch.
+
+The rule is the mirror of extraction's: **the journal never claims a file before its compressed bytes are flushed, and a file is never deleted before the journal claims it.** Everything past `committed_len` is a block no journal claims, so a resume cuts the archive back to it and packs those files again.
+
+A pack keeps three files beside the archive, because the files themselves are gone as they are packed and the 7z header, which names every file, is written only at the end:
+
+| File | Holds |
+|---|---|
+| `game.7z.hatchzip` | The journal: version 9 and `kind: pack`, the source and target folders, the archive's committed length, the files packed, and the checksum of the list. Older builds refuse version 9, and the extraction journal loader names a pack journal for what it is, pointing at the folder to finish. |
+| `game.7z.hatchzip-list` | The walk: every file and folder with its name, size, time and mode, written once before the first batch. |
+| `game.7z.hatchzip-index` | One 20-byte row per packed block: the compressed size and checksum, the file's checksum, and the dictionary used. Appended per commit, so a resume can write the end header without reading the blocks back. |
+
+At the end the end header is written (raw, not LZMA-encoded, which the format allows) from the list and the index rows, the start header's tail is pointed at it, and only then are the empty files and the folders, deepest first, deleted. Whatever appeared in the folder while the pack ran is left where it is and named in the finish message.
+
+| Interrupted | State on disk | What a resume does |
+|---|---|---|
+| While compressing or appending | The archive is longer than `committed_len` | Cuts it back to `committed_len` and packs the batch again; its files are all still there |
+| After the journal write, before the deletes | The journal claims files still on disk | Deletes them, having nothing to read, and goes on |
+| During the end header | The archive is whole blocks without a header | Writes the header; the start header patch is deterministic, wherever the crash left it |
+| During the cleanup | The archive is whole, the journal is still there | Empties the folders again, which is nothing where they are already gone |
+
+A pack that stopped between creating its files and saving its journal leaves them with nothing pointing at them; the next run takes back an archive that is exactly the 32-byte signature header and nothing else, which no tool writes, rather than refuse.
+
+The space check is a bound, not a guess. A file is deleted only once its whole block is written, so the run holds at most the largest file twice, and LZMA2 falls back to uncompressed chunks rather than expand data, so a batch never grows the archive by more than its files plus a thousandth plus a little for the header, the list and the index. The check refuses a folder whose largest file does not fit the space free beside it, naming the file; a folder of smaller files always fits, whatever their number, because each batch is sized against the space free at that moment. One huge file cannot be freed while it is compressed yet: that needs the same hole punching and resume points extraction has inside a large file, and is still to come.
+
+Refused before anything is packed: symbolic links and hard links (a link would be followed to its target, and a file with several names would have its bytes counted twice but freed once), anything that is neither a file nor a folder, names that are not text, a name with a `\` in it (extraction reads one as a folder separator, so the round trip would rename the file), a target that already exists, and side files already in the way.
+
+`restore` does not apply to a pack: what is packed is already deleted, so there is nothing to put back. The only ways out are finishing the pack, or extracting the finished archive.
 
 ## The space check
 

@@ -221,6 +221,19 @@ With `--replace`, before anything is extracted, every existing file or link at t
 - `hatchzip restore` moves the replaced files back to where they were. An extraction in place is the exception: a file already extracted there is no longer in the archive, so the file it replaced stays in `.hatchzip-replaced`, and restore says how many did. With `--keep-archive`, every replaced file goes back.
 - A folder is never replaced: a folder where the archive has a file, or a file where it needs a folder, is refused as before. So is a link on the way to any path, and an archive that contains `.hatchzip-replaced` itself.
 
+### Pack
+
+```sh
+hatchzip pack game                 # game.7z appears beside it, game disappears as it goes
+hatchzip pack game -o D:\Backups\game.7z
+```
+
+The other direction of the same idea. Each file is compressed into the 7z on its own and deleted the moment its compressed copy is safely on disk, so the disk never holds much more than whichever of the folder and the archive is larger. The result is a normal 7z that 7-Zip reads, with every file's time kept; HatchZip extracts it back in place, byte for byte.
+
+The same command resumes an interrupted pack: progress lives in `game.7z.hatchzip` and two small side files next to the archive, which hold the list of files and a row per packed block, since the files themselves are gone as they are packed. **A pack cannot be undone**: what is packed is deleted, so the only ways out are finishing it or copying the files back out of the finished archive.
+
+Refused before anything is packed: links (a link would be followed, a file with several names would be counted twice and freed once), names a backslash in, and a single file larger than the space free beside it, since a file is deleted only once its whole compressed block is written. `--keep-free` and `-y` work as for extraction, and exit code 3 means there was not enough space.
+
 ### Several archives
 
 ```sh
