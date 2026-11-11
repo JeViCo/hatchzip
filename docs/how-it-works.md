@@ -291,13 +291,15 @@ At the end the end header is written (raw, not LZMA-encoded, which the format al
 | During the end header | The archive is whole blocks without a header | Writes the header; the start header patch is deterministic, wherever the crash left it |
 | During the cleanup | The archive is whole, the journal is still there | Empties the folders again, which is nothing where they are already gone |
 
+`hatchzip pack <folder> --finish` ends a pack early on purpose. The end header is written for the packed prefix alone, so the archive becomes a readable 7z holding exactly the files that were packed, and everything the walk had not reached stays in the folder, untouched. The journal and its side files go away, so the pack cannot be resumed afterwards; nothing is deleted, so nothing is lost. With nothing packed yet, finishing only removes the half-made archive and leaves the folder as it was. The resume refusals name it as the way out when a source file has changed or disappeared for good.
+
 A pack that stopped between creating its files and saving its journal leaves them with nothing pointing at them; the next run takes back an archive that is exactly the 32-byte signature header and nothing else, which no tool writes, rather than refuse.
 
 The space check is a bound, not a guess. A file is deleted only once its whole block is written, so the run holds at most the largest file twice, and LZMA2 falls back to uncompressed chunks rather than expand data, so a batch never grows the archive by more than its files plus a thousandth plus a little for the header, the list and the index. The check refuses a folder whose largest file does not fit the space free beside it, naming the file; a folder of smaller files always fits, whatever their number, because each batch is sized against the space free at that moment. One huge file cannot be freed while it is compressed yet: that needs the same hole punching and resume points extraction has inside a large file, and is still to come.
 
 Refused before anything is packed: symbolic links and hard links (a link would be followed to its target, and a file with several names would have its bytes counted twice but freed once), anything that is neither a file nor a folder, names that are not text, a name with a `\` in it (extraction reads one as a folder separator, so the round trip would rename the file), a target that already exists, and side files already in the way.
 
-`restore` does not apply to a pack: what is packed is already deleted, so there is nothing to put back. The only ways out are finishing the pack, or extracting the finished archive.
+`restore` does not apply to a pack: what is packed is already deleted, so there is nothing to put back. The ways out are finishing the pack, finishing it early with `--finish` (above), or extracting the finished archive.
 
 ## The space check
 

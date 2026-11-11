@@ -230,7 +230,9 @@ hatchzip pack game -o D:\Backups\game.7z
 
 The other direction of the same idea. Each file is compressed into the 7z on its own and deleted the moment its compressed copy is safely on disk, so the disk never holds much more than whichever of the folder and the archive is larger. The result is a normal 7z that 7-Zip reads, with every file's time kept; HatchZip extracts it back in place, byte for byte.
 
-The same command resumes an interrupted pack: progress lives in `game.7z.hatchzip` and two small side files next to the archive, which hold the list of files and a row per packed block, since the files themselves are gone as they are packed. **A pack cannot be undone**: what is packed is deleted, so the only ways out are finishing it or copying the files back out of the finished archive.
+The same command resumes an interrupted pack: progress lives in `game.7z.hatchzip` and two small side files next to the archive, which hold the list of files and a row per packed block, since the files themselves are gone as they are packed. **A pack cannot be undone**: what is packed is deleted, so the only ways out are finishing it, keeping what is packed so far with `hatchzip pack game --finish`, or extracting the finished archive.
+
+`--finish` ends a pack early on purpose: what is packed so far becomes a readable `game.7z`, and everything not yet packed stays in the folder, untouched. Nothing is lost either way, but the journal goes with it, so the pack cannot be resumed afterwards. If a source file changes or disappears while the pack runs, the error names `--finish` as the way out.
 
 Refused before anything is packed: links (a link would be followed, a file with several names would be counted twice and freed once), names a backslash in, and a single file larger than the space free beside it, since a file is deleted only once its whole compressed block is written. `--keep-free` and `-y` work as for extraction, and exit code 3 means there was not enough space.
 
